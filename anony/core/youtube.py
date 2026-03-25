@@ -2,7 +2,6 @@
 # Licensed under the MIT License.
 # This file is part of AnonXMusic
 
-
 import os
 import re
 import yt_dlp
@@ -32,10 +31,14 @@ class YouTube:
 
     def get_cookies(self):
         if not self.checked:
+            # 🔥 FIX: Ensure directory exists before listing
+            os.makedirs(self.cookie_dir, exist_ok=True)
+
             for file in os.listdir(self.cookie_dir):
                 if file.endswith(".txt"):
                     self.cookies.append(f"{self.cookie_dir}/{file}")
             self.checked = True
+
         if not self.cookies:
             if not self.warned:
                 self.warned = True
@@ -45,6 +48,10 @@ class YouTube:
 
     async def save_cookies(self, urls: list[str]) -> None:
         logger.info("Saving cookies from urls...")
+
+        # 🔥 FIX: Ensure directory exists before saving
+        os.makedirs(self.cookie_dir, exist_ok=True)
+
         async with aiohttp.ClientSession() as session:
             for url in urls:
                 name = url.split("/")[-1]
@@ -53,6 +60,7 @@ class YouTube:
                     resp.raise_for_status()
                     with open(f"{self.cookie_dir}/{name}.txt", "wb") as fw:
                         fw.write(await resp.read())
+
         logger.info(f"Cookies saved in {self.cookie_dir}.")
 
     def valid(self, url: str) -> bool:
@@ -104,6 +112,9 @@ class YouTube:
         ext = "mp4" if video else "webm"
         filename = f"downloads/{video_id}.{ext}"
 
+        # 🔥 (Optional but recommended) ensure downloads dir exists
+        os.makedirs("downloads", exist_ok=True)
+
         if Path(filename).exists():
             return filename
 
@@ -136,7 +147,8 @@ class YouTube:
                 try:
                     ydl.download([url])
                 except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError):
-                    if cookie: self.cookies.remove(cookie)
+                    if cookie:
+                        self.cookies.remove(cookie)
                     return None
                 except Exception as ex:
                     logger.warning("Download failed: %s", ex)
