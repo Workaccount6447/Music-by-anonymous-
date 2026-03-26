@@ -12,22 +12,26 @@ class GroupDB:
     # WELCOME / GOODBYE MESSAGES
     # ─────────────────────────────────────────────────────────────────────────
 
-    async def set_welcome(self, chat_id: int, text: str, delete_after: int = 0) -> None:
-        """Store a custom welcome message and optional auto-delete delay (seconds)."""
+    async def set_welcome(self, chat_id: int, text: str, delete_after: int = 0, photo_url: str = None) -> None:
+        """Store a custom welcome message, optional auto-delete delay (seconds), and optional photo."""
+        update_data = {"welcome": text, "welcome_delete": delete_after}
+        if photo_url is not None:
+            update_data["welcome_photo"] = photo_url
         await self.db.greetings.update_one(
             {"_id": chat_id},
-            {"$set": {"welcome": text, "welcome_delete": delete_after}},
+            {"$set": update_data},
             upsert=True,
         )
 
     async def get_welcome(self, chat_id: int) -> dict:
-        """Return {'text': str, 'delete_after': int} or empty dict."""
+        """Return {'text': str, 'delete_after': int, 'photo': str|None} or empty dict."""
         doc = await self.db.greetings.find_one({"_id": chat_id})
         if not doc:
             return {}
         return {
             "text": doc.get("welcome", ""),
             "delete_after": doc.get("welcome_delete", 0),
+            "photo": doc.get("welcome_photo", None),
         }
 
     async def del_welcome(self, chat_id: int) -> None:
@@ -35,14 +39,22 @@ class GroupDB:
             {"_id": chat_id}, {"$unset": {"welcome": "", "welcome_delete": ""}}
         )
 
-    async def set_goodbye(self, chat_id: int, text: str) -> None:
+    async def set_goodbye(self, chat_id: int, text: str, photo_url: str = None) -> None:
+        update_data = {"goodbye": text}
+        if photo_url is not None:
+            update_data["goodbye_photo"] = photo_url
         await self.db.greetings.update_one(
-            {"_id": chat_id}, {"$set": {"goodbye": text}}, upsert=True
+            {"_id": chat_id}, {"$set": update_data}, upsert=True
         )
 
-    async def get_goodbye(self, chat_id: int) -> str:
+    async def get_goodbye(self, chat_id: int) -> dict:
         doc = await self.db.greetings.find_one({"_id": chat_id})
-        return doc.get("goodbye", "") if doc else ""
+        if not doc:
+            return {}
+        return {
+            "text": doc.get("goodbye", ""),
+            "photo": doc.get("goodbye_photo", None),
+        }
 
     async def del_goodbye(self, chat_id: int) -> None:
         await self.db.greetings.update_one(
@@ -183,3 +195,74 @@ class GroupDB:
         await self.db.locks.update_one(
             {"_id": chat_id}, {"$pull": {"types": lock_type}}
         )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ANTI-WORDS  (per-group badword list, managed via bot DM)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def add_antiword(self, chat_id: int, word: str) -> None:
+        await self.db.antiwords.update_one(
+            {"_id": chat_id},
+            {"$addToSet": {"words": word.lower()}},
+            upsert=True,
+        )
+
+    async def remove_antiword(self, chat_id: int, word: str) -> bool:
+        result = await self.db.antiwords.update_one(
+            {"_id": chat_id},
+            {"$pull": {"words": word.lower()}},
+        )
+        return result.modified_count > 0
+
+    async def get_antiwords(self, chat_id: int) -> list:
+        doc = await self.db.antiwords.find_one({"_id": chat_id})
+        return doc.get("words", []) if doc else []
+
+    async def clear_antiwords(self, chat_id: int) -> None:
+        await self.db.antiwords.delete_one({"_id": chat_id})
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ANTI-LINK toggle
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def set_antilink(self, chat_id: int, enabled: bool) -> None:
+        await self.db.chat_settings.update_one(
+            {"_id": chat_id}, {"$set": {"antilink": enabled}}, upsert=True
+        )
+
+    async def get_antilink(self, chat_id: int) -> bool:
+        doc = await self.db.chat_settings.find_one({"_id": chat_id})
+        return bool(doc.get("antilink", False)) if doc else False
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ANTI-FORWARD toggle
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def set_antiforward(self, chat_id: int, enabled: bool) -> None:
+        await self.db.chat_settings.update_one(
+            {"_id": chat_id}, {"$set": {"antiforward": enabled}}, upsert=True
+        )
+
+    async def get_antiforward(self, chat_id: int) -> bool:
+        doc = await self.db.chat_settings.find_one({"_id": chat_id})
+        return bool(doc.get("antiforward", False)) if doc else False
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # CAPTCHA toggle
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def set_captcha(self, chat_id: int, enabled: bool) -> None:
+        await self.db.chat_settings.update_one(
+            {"_id": chat_id}, {"$set": {"captcha": enabled}}, upsert=True
+        )
+
+    async def get_captcha(self, chat_id: int) -> bool:
+        doc = await self.db.chat_settings.find_one({"_id": chat_id})
+        return bool(doc.get("captcha", False)) if doc else False
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # CAPTCHA pending verifications  {chat_id: {user_id: message_id}}
+    # stored in-memory; no need to persist across restarts
+    # ─────────────────────────────────────────────────────────────────────────
+    # (handled entirely in-memory inside groupmanagement.py)
+
