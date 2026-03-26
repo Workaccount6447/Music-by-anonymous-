@@ -2,22 +2,20 @@
 # Group Management Plugin for AnonXMusic
 # Author: Built on top of AnonXMusic by AnonymousX1025
 #
-# Permission levels used throughout this file:
+# Permission levels:
 #   aa  = Group Admins  (Telegram admin / owner)
 #   bb  = Bot admins    (aa + users authorised via /auth command)
-#
-# All significant actions are forwarded to LOGGER_ID channel.
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
 import random
 import re
-import string
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from pyrogram import enums, filters, types
 from pyrogram.errors import (
     ChatAdminRequired,
+    FloodWait,
     UserAdminInvalid,
     UserNotParticipant,
 )
@@ -27,25 +25,27 @@ from anony.helpers._admins import is_admin
 
 # ─── URL regex ───────────────────────────────────────────────────────────────
 _URL_RE = re.compile(
-    r"(https?://|www\.|t\.me/|@\w+\.\w+)"
-    r"|(\b\w[\w-]*\.(com|net|org|io|me|ly|co|gg|tv|xyz|info|biz|app|dev)\b)",
+    r"(https?://|www\.|t\.me/)"
+    r"|(\b[\w-]+\.(com|net|org|io|me|ly|co|gg|tv|xyz|info|biz|app|dev)\b)",
     re.IGNORECASE,
 )
 
-# ─── In-memory captcha store: {chat_id: {user_id: {"code": str, "msg_id": int}}} ──
+# ─── In-memory captcha store: {chat_id: {user_id: {"answer": int, "msg_id": int}}}
 _captcha_pending: dict[int, dict[int, dict]] = {}
 
 # ─── Flood tracker (in-memory, per chat) ─────────────────────────────────────
-_flood_count: dict[int, dict[int, int]] = {}   # {chat_id: {user_id: count}}
+_flood_count: dict[int, dict[int, int]] = {}
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  HELPERS
+# ═════════════════════════════════════════════════════════════════════════════
 
 def _now() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 async def _log(text: str) -> None:
-    """Forward an event to the log channel."""
     try:
         await app.send_message(config.LOGGER_ID, text, parse_mode=enums.ParseMode.HTML)
     except Exception:
@@ -53,18 +53,11 @@ async def _log(text: str) -> None:
 
 
 async def _get_target(message: types.Message) -> types.User | None:
-    """
-    Resolve the target user from:
-      1. A replied-to message
-      2. A @username or user_id argument
-    """
     if message.reply_to_message and message.reply_to_message.from_user:
         return message.reply_to_message.from_user
-
     args = message.text.split(None, 1)
     if len(args) < 2:
         return None
-
     target_str = args[1].split()[0]
     try:
         return await app.get_users(
@@ -80,140 +73,54 @@ def _mention(user: types.User) -> str:
 
 
 async def _assert_admin(message: types.Message) -> bool:
-    """Returns True if the sender is a Telegram admin / owner."""
     if message.from_user.id in app.sudoers:
         return True
     return await is_admin(message.chat.id, message.from_user.id)
 
 
 async def _assert_bb(message: types.Message) -> bool:
-    """Returns True if the sender is aa or is auth-listed (bb)."""
     if await _assert_admin(message):
         return True
     return await db.is_auth(message.chat.id, message.from_user.id)
 
 
-async def _only_groups(message: types.Message) -> bool:
-    if message.chat.type == enums.ChatType.PRIVATE:
-        await message.reply_text("❌ This command only works in groups.")
-        return False
-    return True
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  WELCOME / GOODBYE
-# ═════════════════════════════════════════════════════════════════════════════
-
-@app.on_message(filters.command("setwelcome") & filters.group)
-async def cmd_set_welcome(_, message: types.Message):
-    """aa: /setwelcome <text>  — optionally reply to a photo to set custom welcome photo."""
-    if not await _assert_admin(message):
-        return await message.reply_text("❌ Only group admins can set the welcome message.")
-
-    args = message.text.split(None, 1)
-    if len(args) < 2:
-        return await message.reply_text(
-            "📝 Usage:\n"
-            "<code>/setwelcome Hello {mention}! Welcome to {title}.</code>\n\n"
-            "Variables: <code>{mention}</code> <code>{first}</code> <code>{last}</code> <code>{title}</code> <code>{id}</code>\n\n"
-            "To auto-delete the welcome message after N seconds:\n"
-            "<code>/setwelcome 60 Hello {mention}!</code>\n\n"
-            "To set a custom photo, reply to a photo while running this command."
-        )
-
-    parts = args[1].split(None, 1)
-    delete_after = 0
-    if parts[0].isdigit():
-        delete_after = int(parts[0])
-        text = parts[1] if len(parts) > 1 else ""
-    else:
-        text = args[1]
-
-    if not text:
-        return await message.reply_text("❌ Please provide the welcome message text.")
-
-    # Check if replying to a photo
-    photo_url = None
-    if message.reply_to_message and message.reply_to_message.photo:
-        photo_url = message.reply_to_message.photo.file_id
-
-    await db.set_welcome(message.chat.id, text, delete_after, photo_url)
-    resp = "✅ Welcome message saved."
-    if delete_after:
-        resp += f"\n⏳ Auto-delete after <b>{delete_after}s</b>."
-    if photo_url:
-        resp += "\n🖼 Custom photo saved."
-    else:
-        resp += f"\n🖼 Using default photo from config."
-    await message.reply_text(resp)
-
-    await _log(
-        f"<b>🟢 Welcome Set</b>\n"
-        f"Chat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
-        f"By: {_mention(message.from_user)}\n"
-        f"Delete after: {delete_after}s\n"
-        f"Text: <code>{text[:200]}</code>\n"
-        f"Time: {_now()}"
+def _muted_perms() -> enums.ChatPermissions:
+    return enums.ChatPermissions(
+        can_send_messages=False,
+        can_send_media_messages=False,
+        can_send_other_messages=False,
+        can_add_web_page_previews=False,
+        can_send_polls=False,
     )
 
 
-@app.on_message(filters.command("delwelcome") & filters.group)
-async def cmd_del_welcome(_, message: types.Message):
-    """aa: Remove the custom welcome message."""
-    if not await _assert_admin(message):
-        return await message.reply_text("❌ Only group admins can remove the welcome message.")
-    await db.del_welcome(message.chat.id)
-    await message.reply_text("✅ Welcome message removed.")
-    await _log(
-        f"<b>🗑 Welcome Removed</b>\n"
-        f"Chat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
-        f"By: {_mention(message.from_user)}\n"
-        f"Time: {_now()}"
+def _default_perms() -> enums.ChatPermissions:
+    return enums.ChatPermissions(
+        can_send_messages=True,
+        can_send_media_messages=True,
+        can_send_other_messages=True,
+        can_add_web_page_previews=True,
+        can_send_polls=True,
     )
 
 
-@app.on_message(filters.command("setgoodbye") & filters.group)
-async def cmd_set_goodbye(_, message: types.Message):
-    """aa: /setgoodbye <text> — reply to a photo to set custom goodbye photo."""
-    if not await _assert_admin(message):
-        return await message.reply_text("❌ Only group admins can set the goodbye message.")
-
-    args = message.text.split(None, 1)
-    if len(args) < 2:
-        return await message.reply_text(
-            "📝 Usage: <code>/setgoodbye Goodbye {first}! We'll miss you.</code>\n\n"
-            "Variables: <code>{mention}</code> <code>{first}</code> <code>{last}</code> <code>{title}</code> <code>{id}</code>\n\n"
-            "Reply to a photo while running this command to set a custom goodbye photo."
-        )
-
-    photo_url = None
-    if message.reply_to_message and message.reply_to_message.photo:
-        photo_url = message.reply_to_message.photo.file_id
-
-    await db.set_goodbye(message.chat.id, args[1], photo_url)
-    resp = "✅ Goodbye message saved."
-    if photo_url:
-        resp += "\n🖼 Custom photo saved."
-    else:
-        resp += "\n🖼 Using default photo from config."
-    await message.reply_text(resp)
-
-    await _log(
-        f"<b>🔴 Goodbye Set</b>\n"
-        f"Chat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
-        f"By: {_mention(message.from_user)}\n"
-        f"Text: <code>{args[1][:200]}</code>\n"
-        f"Time: {_now()}"
-    )
+def _parse_time(time_str: str) -> int:
+    """Convert '10m', '2h', '1d' to seconds. Returns 0 on failure."""
+    if not time_str:
+        return 0
+    unit = time_str[-1].lower()
+    num = time_str[:-1]
+    if not num.isdigit():
+        return 0
+    n = int(num)
+    return {"s": n, "m": n * 60, "h": n * 3600, "d": n * 86400}.get(unit, 0)
 
 
-@app.on_message(filters.command("delgoodbye") & filters.group)
-async def cmd_del_goodbye(_, message: types.Message):
-    """aa: Remove the custom goodbye message."""
-    if not await _assert_admin(message):
-        return await message.reply_text("❌ Only group admins can remove the goodbye message.")
-    await db.del_goodbye(message.chat.id)
-    await message.reply_text("✅ Goodbye message removed.")
+def _warn_buttons(target_id: int) -> types.InlineKeyboardMarkup:
+    return types.InlineKeyboardMarkup([[
+        types.InlineKeyboardButton("✅ Remove Last Warn", callback_data=f"rmwarn_{target_id}"),
+        types.InlineKeyboardButton("🗑 Reset All Warns", callback_data=f"resetwarn_{target_id}"),
+    ]])
 
 
 def _format_greeting(template: str, user: types.User, chat: types.Chat) -> str:
@@ -230,6 +137,109 @@ def _format_greeting(template: str, user: types.User, chat: types.Chat) -> str:
     )
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  WELCOME / GOODBYE
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.on_message(filters.command("setwelcome") & filters.group)
+async def cmd_set_welcome(_, message: types.Message):
+    """aa: /setwelcome <text> — reply to a photo to set custom welcome image."""
+    if not await _assert_admin(message):
+        return await message.reply_text("❌ Only group admins can set the welcome message.")
+
+    args = message.text.split(None, 1)
+    if len(args) < 2:
+        return await message.reply_text(
+            "📝 <b>Usage:</b>\n"
+            "<code>/setwelcome Hello {mention}! Welcome to {title}.</code>\n\n"
+            "Variables: <code>{mention}</code> <code>{first}</code> <code>{last}</code> "
+            "<code>{title}</code> <code>{id}</code>\n\n"
+            "Auto-delete timer: <code>/setwelcome 60 Hello {mention}!</code>\n"
+            "Custom photo: reply to a photo while running this command."
+        )
+
+    parts = args[1].split(None, 1)
+    delete_after = 0
+    if parts[0].isdigit():
+        delete_after = int(parts[0])
+        text = parts[1] if len(parts) > 1 else ""
+    else:
+        text = args[1]
+
+    if not text:
+        return await message.reply_text("❌ Please provide the welcome message text.")
+
+    photo_id = None
+    if message.reply_to_message and message.reply_to_message.photo:
+        photo_id = message.reply_to_message.photo.file_id
+
+    await db.set_welcome(message.chat.id, text, delete_after, photo_id)
+
+    resp = "✅ Welcome message saved."
+    if delete_after:
+        resp += f"\n⏳ Auto-delete after <b>{delete_after}s</b>."
+    resp += f"\n🖼 Photo: {'custom' if photo_id else 'default from config'}."
+    await message.reply_text(resp)
+    await _log(
+        f"<b>🟢 Welcome Set</b>\n"
+        f"Chat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
+        f"By: {_mention(message.from_user)}\nDelete after: {delete_after}s\n"
+        f"Text: <code>{text[:200]}</code>\nTime: {_now()}"
+    )
+
+
+@app.on_message(filters.command("delwelcome") & filters.group)
+async def cmd_del_welcome(_, message: types.Message):
+    if not await _assert_admin(message):
+        return await message.reply_text("❌ Only group admins can remove the welcome message.")
+    await db.del_welcome(message.chat.id)
+    await message.reply_text("✅ Welcome message removed. Default config message will be used.")
+    await _log(
+        f"<b>🗑 Welcome Removed</b>\n"
+        f"Chat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
+        f"By: {_mention(message.from_user)}\nTime: {_now()}"
+    )
+
+
+@app.on_message(filters.command("setgoodbye") & filters.group)
+async def cmd_set_goodbye(_, message: types.Message):
+    """aa: /setgoodbye <text> — reply to a photo to set custom goodbye image."""
+    if not await _assert_admin(message):
+        return await message.reply_text("❌ Only group admins can set the goodbye message.")
+
+    args = message.text.split(None, 1)
+    if len(args) < 2:
+        return await message.reply_text(
+            "📝 <b>Usage:</b> <code>/setgoodbye Goodbye {first}! We'll miss you.</code>\n\n"
+            "Variables: <code>{mention}</code> <code>{first}</code> <code>{last}</code> "
+            "<code>{title}</code> <code>{id}</code>\n"
+            "Reply to a photo to set a custom goodbye image."
+        )
+
+    photo_id = None
+    if message.reply_to_message and message.reply_to_message.photo:
+        photo_id = message.reply_to_message.photo.file_id
+
+    await db.set_goodbye(message.chat.id, args[1], photo_id)
+    resp = "✅ Goodbye message saved."
+    resp += f"\n🖼 Photo: {'custom' if photo_id else 'default from config'}."
+    await message.reply_text(resp)
+    await _log(
+        f"<b>🔴 Goodbye Set</b>\n"
+        f"Chat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
+        f"By: {_mention(message.from_user)}\n"
+        f"Text: <code>{args[1][:200]}</code>\nTime: {_now()}"
+    )
+
+
+@app.on_message(filters.command("delgoodbye") & filters.group)
+async def cmd_del_goodbye(_, message: types.Message):
+    if not await _assert_admin(message):
+        return await message.reply_text("❌ Only group admins can remove the goodbye message.")
+    await db.del_goodbye(message.chat.id)
+    await message.reply_text("✅ Goodbye message removed.")
+
+
 @app.on_chat_member_updated(filters.group)
 async def on_member_update(_, update: types.ChatMemberUpdated):
     chat = update.chat
@@ -238,33 +248,30 @@ async def on_member_update(_, update: types.ChatMemberUpdated):
 
     old_status = getattr(update.old_chat_member, "status", None)
     new_status = getattr(update.new_chat_member, "status", None)
-
     user = update.new_chat_member.user if update.new_chat_member else update.old_chat_member.user
 
     # ── User joined ──────────────────────────────────────────────────────────
-    if new_status == enums.ChatMemberStatus.MEMBER and old_status not in (
-        enums.ChatMemberStatus.MEMBER,
-        enums.ChatMemberStatus.ADMINISTRATOR,
-        enums.ChatMemberStatus.OWNER,
-    ):
-        # Captcha check
+    joined = (
+        new_status == enums.ChatMemberStatus.MEMBER
+        and old_status not in (
+            enums.ChatMemberStatus.MEMBER,
+            enums.ChatMemberStatus.ADMINISTRATOR,
+            enums.ChatMemberStatus.OWNER,
+        )
+    )
+    if joined:
+        # Trigger captcha first if enabled
         if await db.get_captcha(chat.id):
             await _send_captcha(chat, user)
 
         data = await db.get_welcome(chat.id)
-        # Use custom text if set, else fall back to config default
         raw_text = data.get("text") or config.WELCOME_TEXT
         photo = data.get("photo") or config.WELCOME_PHOTO
         text = _format_greeting(raw_text, user, chat)
 
         try:
-            sent = await app.send_photo(
-                chat.id,
-                photo=photo,
-                caption=text,
-            )
+            sent = await app.send_photo(chat.id, photo=photo, caption=text)
         except Exception:
-            # If photo fails, send plain text
             sent = await app.send_message(chat.id, text)
 
         delete_after = data.get("delete_after", 0)
@@ -274,19 +281,22 @@ async def on_member_update(_, update: types.ChatMemberUpdated):
                 await sent.delete()
             except Exception:
                 pass
+        return
 
     # ── User left / kicked ───────────────────────────────────────────────────
-    elif new_status in (enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED) and old_status in (
-        enums.ChatMemberStatus.MEMBER,
-        enums.ChatMemberStatus.ADMINISTRATOR,
-        enums.ChatMemberStatus.OWNER,
-    ):
+    left = (
+        new_status in (enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED)
+        and old_status in (
+            enums.ChatMemberStatus.MEMBER,
+            enums.ChatMemberStatus.ADMINISTRATOR,
+            enums.ChatMemberStatus.OWNER,
+        )
+    )
+    if left:
         data = await db.get_goodbye(chat.id)
-        raw_text = data.get("text") if isinstance(data, dict) else data
-        raw_text = raw_text or config.GOODBYE_TEXT
-        photo = (data.get("photo") if isinstance(data, dict) else None) or config.WELCOME_PHOTO
+        raw_text = data.get("text") or config.GOODBYE_TEXT
+        photo = data.get("photo") or config.WELCOME_PHOTO
         text = _format_greeting(raw_text, user, chat)
-
         try:
             await app.send_photo(chat.id, photo=photo, caption=text)
         except Exception:
@@ -305,7 +315,7 @@ async def cmd_ban(_, message: types.Message):
 
     target = await _get_target(message)
     if not target:
-        return await message.reply_text("❌ Reply to a user or provide @username/user_id.")
+        return await message.reply_text("❌ Reply to a user or provide @username / user_id.")
 
     if await is_admin(message.chat.id, target.id):
         return await message.reply_text("❌ Cannot ban an admin.")
@@ -324,12 +334,9 @@ async def cmd_ban(_, message: types.Message):
             resp += f"\n📋 Reason: {reason}"
         await message.reply_text(resp)
         await _log(
-            f"<b>🚫 User Banned</b>\n"
-            f"Chat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
-            f"User: {_mention(target)} (<code>{target.id}</code>)\n"
-            f"By: {_mention(message.from_user)}\n"
-            f"Reason: {reason or 'None'}\n"
-            f"Time: {_now()}"
+            f"<b>🚫 User Banned</b>\nChat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
+            f"User: {_mention(target)} (<code>{target.id}</code>)\nBy: {_mention(message.from_user)}\n"
+            f"Reason: {reason or 'None'}\nTime: {_now()}"
         )
     except ChatAdminRequired:
         await message.reply_text("❌ I need ban permissions to do this.")
@@ -345,16 +352,14 @@ async def cmd_unban(_, message: types.Message):
 
     target = await _get_target(message)
     if not target:
-        return await message.reply_text("❌ Reply to a user or provide @username/user_id.")
+        return await message.reply_text("❌ Reply to a user or provide @username / user_id.")
 
     try:
         await app.unban_chat_member(message.chat.id, target.id)
         await message.reply_text(f"✅ {_mention(target)} has been <b>unbanned</b>.")
         await _log(
-            f"<b>✅ User Unbanned</b>\n"
-            f"Chat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
-            f"User: {_mention(target)} (<code>{target.id}</code>)\n"
-            f"By: {_mention(message.from_user)}\n"
+            f"<b>✅ User Unbanned</b>\nChat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
+            f"User: {_mention(target)} (<code>{target.id}</code>)\nBy: {_mention(message.from_user)}\n"
             f"Time: {_now()}"
         )
     except ChatAdminRequired:
@@ -373,7 +378,7 @@ async def cmd_kick(_, message: types.Message):
 
     target = await _get_target(message)
     if not target:
-        return await message.reply_text("❌ Reply to a user or provide @username/user_id.")
+        return await message.reply_text("❌ Reply to a user or provide @username / user_id.")
 
     if await is_admin(message.chat.id, target.id):
         return await message.reply_text("❌ Cannot kick an admin.")
@@ -393,12 +398,9 @@ async def cmd_kick(_, message: types.Message):
             resp += f"\n📋 Reason: {reason}"
         await message.reply_text(resp)
         await _log(
-            f"<b>👢 User Kicked</b>\n"
-            f"Chat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
-            f"User: {_mention(target)} (<code>{target.id}</code>)\n"
-            f"By: {_mention(message.from_user)}\n"
-            f"Reason: {reason or 'None'}\n"
-            f"Time: {_now()}"
+            f"<b>👢 User Kicked</b>\nChat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
+            f"User: {_mention(target)} (<code>{target.id}</code>)\nBy: {_mention(message.from_user)}\n"
+            f"Reason: {reason or 'None'}\nTime: {_now()}"
         )
     except ChatAdminRequired:
         await message.reply_text("❌ I need kick permissions.")
@@ -410,39 +412,30 @@ async def cmd_kick(_, message: types.Message):
 
 @app.on_message(filters.command("mute") & filters.group)
 async def cmd_mute(_, message: types.Message):
-    """bb: Mute a user (restrict messages)."""
+    """bb: Mute a user (restrict all messages)."""
     if not await _assert_bb(message):
         return await message.reply_text("❌ You need to be an admin or authorised user to mute.")
 
     target = await _get_target(message)
     if not target:
-        return await message.reply_text("❌ Reply to a user or provide @username/user_id.")
+        return await message.reply_text("❌ Reply to a user or provide @username / user_id.")
 
     if await is_admin(message.chat.id, target.id):
         return await message.reply_text("❌ Cannot mute an admin.")
 
     try:
-        await app.restrict_chat_member(
-            message.chat.id,
-            target.id,
-            enums.ChatPermissions(
-                can_send_messages=False,
-                can_send_media_messages=False,
-                can_send_other_messages=False,
-                can_add_web_page_previews=False,
-            ),
-        )
+        await app.restrict_chat_member(message.chat.id, target.id, _muted_perms())
         await db.mute_user(message.chat.id, target.id)
         await message.reply_text(f"🔇 {_mention(target)} has been <b>muted</b>.")
         await _log(
-            f"<b>🔇 User Muted</b>\n"
-            f"Chat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
-            f"User: {_mention(target)} (<code>{target.id}</code>)\n"
-            f"By: {_mention(message.from_user)}\n"
+            f"<b>🔇 User Muted</b>\nChat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
+            f"User: {_mention(target)} (<code>{target.id}</code>)\nBy: {_mention(message.from_user)}\n"
             f"Time: {_now()}"
         )
     except ChatAdminRequired:
-        await message.reply_text("❌ I need restrict permissions.")
+        await message.reply_text("❌ I need restrict permissions. Make sure I'm admin with 'Restrict Members'.")
+    except Exception as e:
+        await message.reply_text(f"❌ Failed: {e}")
 
 
 @app.on_message(filters.command("unmute") & filters.group)
@@ -453,44 +446,45 @@ async def cmd_unmute(_, message: types.Message):
 
     target = await _get_target(message)
     if not target:
-        return await message.reply_text("❌ Reply to a user or provide @username/user_id.")
+        return await message.reply_text("❌ Reply to a user or provide @username / user_id.")
 
     try:
-        chat = await app.get_chat(message.chat.id)
-        default_perms = chat.permissions
-        await app.restrict_chat_member(
-            message.chat.id, target.id, default_perms or enums.ChatPermissions(
-                can_send_messages=True,
-                can_send_media_messages=True,
-                can_send_other_messages=True,
-                can_add_web_page_previews=True,
-            )
-        )
+        # Try to get chat's default permissions, fall back to full perms
+        try:
+            chat_obj = await app.get_chat(message.chat.id)
+            default_perms = chat_obj.permissions or _default_perms()
+        except Exception:
+            default_perms = _default_perms()
+
+        await app.restrict_chat_member(message.chat.id, target.id, default_perms)
         await db.unmute_user(message.chat.id, target.id)
         await message.reply_text(f"🔊 {_mention(target)} has been <b>unmuted</b>.")
         await _log(
-            f"<b>🔊 User Unmuted</b>\n"
-            f"Chat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
-            f"User: {_mention(target)} (<code>{target.id}</code>)\n"
-            f"By: {_mention(message.from_user)}\n"
+            f"<b>🔊 User Unmuted</b>\nChat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
+            f"User: {_mention(target)} (<code>{target.id}</code>)\nBy: {_mention(message.from_user)}\n"
             f"Time: {_now()}"
         )
     except ChatAdminRequired:
         await message.reply_text("❌ I need restrict permissions.")
+    except Exception as e:
+        await message.reply_text(f"❌ Failed: {e}")
 
 
 @app.on_message(filters.command("tmute") & filters.group)
 async def cmd_tmute(_, message: types.Message):
-    """bb: /tmute <time> — Mute for a duration. Time: 10m / 2h / 1d"""
+    """bb: /tmute <time> [@user] — Temp mute. Time: 10m / 2h / 1d"""
     if not await _assert_bb(message):
         return await message.reply_text("❌ Admins/authorised users only.")
 
     target = await _get_target(message)
     if not target:
-        return await message.reply_text("❌ Reply to a user or provide @username/user_id.")
+        return await message.reply_text("❌ Reply to a user or provide @username / user_id.")
 
+    if await is_admin(message.chat.id, target.id):
+        return await message.reply_text("❌ Cannot mute an admin.")
+
+    # Find time arg from any position in the command
     args = message.text.split()
-    # Find the time argument regardless of position (works with reply or @username)
     time_str = ""
     for a in args[1:]:
         if _parse_time(a):
@@ -498,48 +492,29 @@ async def cmd_tmute(_, message: types.Message):
             break
     seconds = _parse_time(time_str)
     if not seconds:
-        return await message.reply_text("❌ Invalid time. Examples: <code>10m</code>, <code>2h</code>, <code>1d</code>")
-
-    if await is_admin(message.chat.id, target.id):
-        return await message.reply_text("❌ Cannot mute an admin.")
+        return await message.reply_text(
+            "❌ Invalid or missing time.\nExamples: <code>/tmute 10m</code>, <code>/tmute 2h</code>, <code>/tmute 1d</code>"
+        )
 
     try:
-        from datetime import timedelta
         until = datetime.utcnow() + timedelta(seconds=seconds)
         await app.restrict_chat_member(
-            message.chat.id, target.id,
-            enums.ChatPermissions(),
-            until_date=until,
+            message.chat.id, target.id, _muted_perms(), until_date=until
         )
-        await message.reply_text(
-            f"🔇 {_mention(target)} muted for <b>{time_str}</b>."
-        )
+        await message.reply_text(f"🔇 {_mention(target)} muted for <b>{time_str}</b>.")
         await _log(
-            f"<b>🔇 User Temp-Muted</b>\n"
-            f"Chat: <b>{message.chat.title}</b>\n"
+            f"<b>🔇 Temp-Muted</b>\nChat: <b>{message.chat.title}</b>\n"
             f"User: {_mention(target)} (<code>{target.id}</code>)\n"
-            f"Duration: {time_str}\n"
-            f"By: {_mention(message.from_user)}\n"
-            f"Time: {_now()}"
+            f"Duration: {time_str}\nBy: {_mention(message.from_user)}\nTime: {_now()}"
         )
     except ChatAdminRequired:
         await message.reply_text("❌ I need restrict permissions.")
-
-
-def _parse_time(time_str: str) -> int:
-    """Convert '10m', '2h', '1d' to seconds. Returns 0 on failure."""
-    if not time_str:
-        return 0
-    unit = time_str[-1].lower()
-    num = time_str[:-1]
-    if not num.isdigit():
-        return 0
-    n = int(num)
-    return {"s": n, "m": n * 60, "h": n * 3600, "d": n * 86400}.get(unit, 0)
+    except Exception as e:
+        await message.reply_text(f"❌ Failed: {e}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  DELETE / PURGE
+#  DELETE / PURGE / DELALL
 # ═════════════════════════════════════════════════════════════════════════════
 
 @app.on_message(filters.command("del") & filters.group)
@@ -555,12 +530,12 @@ async def cmd_delete(_, message: types.Message):
         await message.reply_to_message.delete()
         await message.delete()
     except Exception:
-        await message.reply_text("❌ Couldn't delete the message.")
+        await message.reply_text("❌ Couldn't delete the message. Check my permissions.")
 
 
 @app.on_message(filters.command("purge") & filters.group)
 async def cmd_purge(_, message: types.Message):
-    """bb: /purge — Delete all messages from replied message up to this one."""
+    """bb: Delete all messages from replied message up to this one."""
     if not await _assert_bb(message):
         return await message.reply_text("❌ Admins/authorised users only.")
 
@@ -585,19 +560,15 @@ async def cmd_purge(_, message: types.Message):
         await sent.delete()
     except Exception:
         pass
-
     await _log(
-        f"<b>🗑 Purge</b>\n"
-        f"Chat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
-        f"Deleted: {deleted} messages\n"
-        f"By: {_mention(message.from_user)}\n"
-        f"Time: {_now()}"
+        f"<b>🗑 Purge</b>\nChat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
+        f"Deleted: {deleted} messages\nBy: {_mention(message.from_user)}\nTime: {_now()}"
     )
 
 
 @app.on_message(filters.command("delall") & filters.group)
 async def cmd_delall(_, message: types.Message):
-    """bb: /delall — Delete all messages from a specific user (reply or @username)."""
+    """bb: Delete all messages from a user by iterating history (bot-compatible)."""
     if not await _assert_bb(message):
         return await message.reply_text("❌ Admins/authorised users only.")
 
@@ -608,33 +579,65 @@ async def cmd_delall(_, message: types.Message):
     if await is_admin(message.chat.id, target.id):
         return await message.reply_text("❌ Cannot delete messages of an admin.")
 
+    sent = await message.reply_text(f"🗑 Deleting messages from {_mention(target)}... please wait.")
+
+    # Bots cannot use channels.DeleteParticipantHistory, so we iterate history
+    deleted = 0
+    ids_to_delete = []
     try:
-        await app.delete_user_history(message.chat.id, target.id)
-        await message.reply_text(f"🗑 Deleted all messages from {_mention(target)}.")
-        await _log(
-            f"<b>🗑 Delete All Messages</b>\n"
-            f"Chat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
-            f"User: {_mention(target)} (<code>{target.id}</code>)\n"
-            f"By: {_mention(message.from_user)}\n"
-            f"Time: {_now()}"
-        )
+        async for msg in app.get_chat_history(message.chat.id, limit=3000):
+            if msg.from_user and msg.from_user.id == target.id:
+                ids_to_delete.append(msg.id)
+            if len(ids_to_delete) >= 100:
+                await app.delete_messages(message.chat.id, ids_to_delete)
+                deleted += len(ids_to_delete)
+                ids_to_delete = []
+                await asyncio.sleep(0.3)
+
+        if ids_to_delete:
+            await app.delete_messages(message.chat.id, ids_to_delete)
+            deleted += len(ids_to_delete)
+
+    except ChatAdminRequired:
+        return await sent.edit_text("❌ I need 'Delete Messages' admin permission.")
     except Exception as e:
-        await message.reply_text(f"❌ Failed: {e}")
+        return await sent.edit_text(f"❌ Error: {e}")
+
+    await sent.edit_text(f"✅ Deleted <b>{deleted}</b> messages from {_mention(target)}.")
+    await _log(
+        f"<b>🗑 Delete All Messages</b>\nChat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
+        f"User: {_mention(target)} (<code>{target.id}</code>)\n"
+        f"Deleted: {deleted} msgs\nBy: {_mention(message.from_user)}\nTime: {_now()}"
+    )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  WARNINGS
 # ═════════════════════════════════════════════════════════════════════════════
 
+async def _issue_warn(chat_id: int, chat_title: str, target: types.User,
+                      by: types.User, reason: str = "") -> tuple[int, int]:
+    """Add a warn. Returns (new_count, limit)."""
+    count = await db.warn_user(chat_id, target.id, reason or "No reason")
+    limit = await db.get_warn_limit(chat_id)
+    await _log(
+        f"<b>⚠️ User Warned</b>\nChat: <b>{chat_title}</b>\n"
+        f"User: {_mention(target)} (<code>{target.id}</code>)\n"
+        f"Warns: {count}/{limit}\nReason: {reason or 'None'}\n"
+        f"By: {_mention(by)}\nTime: {_now()}"
+    )
+    return count, limit
+
+
 @app.on_message(filters.command("warn") & filters.group)
 async def cmd_warn(_, message: types.Message):
-    """bb: Warn a user. On reaching warn limit, they are banned."""
+    """bb: Warn a user. Auto-ban on reaching warn limit."""
     if not await _assert_bb(message):
         return await message.reply_text("❌ Admins/authorised users only.")
 
     target = await _get_target(message)
     if not target:
-        return await message.reply_text("❌ Reply to a user or provide @username/user_id.")
+        return await message.reply_text("❌ Reply to a user or provide @username / user_id.")
 
     if await is_admin(message.chat.id, target.id):
         return await message.reply_text("❌ Cannot warn an admin.")
@@ -646,46 +649,30 @@ async def cmd_warn(_, message: types.Message):
     elif not message.reply_to_message and len(args) > 2:
         reason = args[2]
 
-    count = await db.warn_user(message.chat.id, target.id, reason)
-    limit = await db.get_warn_limit(message.chat.id)
+    count, limit = await _issue_warn(
+        message.chat.id, message.chat.title, target, message.from_user, reason
+    )
 
     if count >= limit:
         try:
             await app.ban_chat_member(message.chat.id, target.id)
             await db.reset_warns(message.chat.id, target.id)
             await message.reply_text(
-                f"⚠️ {_mention(target)} has reached <b>{limit}</b> warnings and has been <b>banned</b>."
-            )
-            await _log(
-                f"<b>⚠️➡️🚫 Warn-Ban</b>\n"
-                f"Chat: <b>{message.chat.title}</b>\n"
-                f"User: {_mention(target)} (<code>{target.id}</code>)\n"
-                f"Warns hit limit ({limit})\n"
-                f"By: {_mention(message.from_user)}\n"
-                f"Time: {_now()}"
+                f"⚠️ {_mention(target)} reached <b>{limit}</b> warnings and has been <b>banned</b>."
             )
         except Exception:
             await message.reply_text("⚠️ Warn limit reached but I couldn't ban the user.")
     else:
-        await message.reply_text(
+        text = (
             f"⚠️ {_mention(target)} has been warned.\n"
             f"Warnings: <b>{count}/{limit}</b>"
             + (f"\nReason: {reason}" if reason else "")
         )
-        await _log(
-            f"<b>⚠️ User Warned</b>\n"
-            f"Chat: <b>{message.chat.title}</b>\n"
-            f"User: {_mention(target)} (<code>{target.id}</code>)\n"
-            f"Warns: {count}/{limit}\n"
-            f"Reason: {reason or 'None'}\n"
-            f"By: {_mention(message.from_user)}\n"
-            f"Time: {_now()}"
-        )
+        await message.reply_text(text, reply_markup=_warn_buttons(target.id))
 
 
 @app.on_message(filters.command("warns") & filters.group)
 async def cmd_warns(_, message: types.Message):
-    """Check warns for yourself or a replied user."""
     target = await _get_target(message) or message.from_user
     warns = await db.get_warns(message.chat.id, target.id)
     limit = await db.get_warn_limit(message.chat.id)
@@ -707,16 +694,14 @@ async def cmd_reset_warn(_, message: types.Message):
 
     target = await _get_target(message)
     if not target:
-        return await message.reply_text("❌ Reply to a user or provide @username/user_id.")
+        return await message.reply_text("❌ Reply to a user or provide @username / user_id.")
 
     await db.reset_warns(message.chat.id, target.id)
     await message.reply_text(f"✅ Warnings cleared for {_mention(target)}.")
     await _log(
-        f"<b>✅ Warns Reset</b>\n"
-        f"Chat: <b>{message.chat.title}</b>\n"
+        f"<b>✅ Warns Reset</b>\nChat: <b>{message.chat.title}</b>\n"
         f"User: {_mention(target)} (<code>{target.id}</code>)\n"
-        f"By: {_mention(message.from_user)}\n"
-        f"Time: {_now()}"
+        f"By: {_mention(message.from_user)}\nTime: {_now()}"
     )
 
 
@@ -730,6 +715,63 @@ async def cmd_set_warn_limit(_, message: types.Message):
         return await message.reply_text("Usage: /setwarnlimit <number>")
     await db.set_warn_limit(message.chat.id, int(args[1]))
     await message.reply_text(f"✅ Warn limit set to <b>{args[1]}</b>.")
+
+
+# ─── Warn inline buttons ─────────────────────────────────────────────────────
+
+@app.on_callback_query(filters.regex(r"^rmwarn_(\d+)$"))
+async def cb_remove_warn(_, query: types.CallbackQuery):
+    """Admin-only: remove one warning from the button on a warn message."""
+    chat = query.message.chat
+    if not await is_admin(chat.id, query.from_user.id):
+        return await query.answer("❌ Only admins can remove warnings.", show_alert=True)
+
+    target_id = int(query.matches[0].group(1))
+    warns = await db.get_warns(chat.id, target_id)
+    if not warns:
+        return await query.answer("✅ This user already has no warnings.", show_alert=True)
+
+    warns.pop()
+    await db.db.warns.update_one(
+        {"_id": f"{chat.id}:{target_id}"}, {"$set": {"warns": warns}}, upsert=True
+    )
+    limit = await db.get_warn_limit(chat.id)
+    await query.answer(f"✅ Warning removed. Now {len(warns)}/{limit}.", show_alert=True)
+    try:
+        new_markup = _warn_buttons(target_id) if warns else None
+        await query.message.edit_reply_markup(new_markup)
+    except Exception:
+        pass
+    await _log(
+        f"<b>✅ Warn Removed (button)</b>\nChat: <b>{chat.title}</b>\n"
+        f"Target ID: <code>{target_id}</code>\nBy: {_mention(query.from_user)}\n"
+        f"Remaining: {len(warns)}/{limit}\nTime: {_now()}"
+    )
+
+
+@app.on_callback_query(filters.regex(r"^resetwarn_(\d+)$"))
+async def cb_reset_warn(_, query: types.CallbackQuery):
+    """Admin-only: reset all warnings from the button on a warn message."""
+    chat = query.message.chat
+    if not await is_admin(chat.id, query.from_user.id):
+        return await query.answer("❌ Only admins can reset warnings.", show_alert=True)
+
+    target_id = int(query.matches[0].group(1))
+    await db.reset_warns(chat.id, target_id)
+    await query.answer("✅ All warnings reset.", show_alert=True)
+    try:
+        await query.message.edit_reply_markup(None)
+    except Exception:
+        pass
+    await _log(
+        f"<b>🗑 All Warns Reset (button)</b>\nChat: <b>{chat.title}</b>\n"
+        f"Target ID: <code>{target_id}</code>\nBy: {_mention(query.from_user)}\nTime: {_now()}"
+    )
+
+
+@app.on_callback_query(filters.regex(r"^noop$"))
+async def cb_noop(_, query: types.CallbackQuery):
+    await query.answer()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -752,7 +794,6 @@ async def cmd_save_note(_, message: types.Message):
 
 @app.on_message(filters.command("get") & filters.group)
 async def cmd_get_note(_, message: types.Message):
-    """/get <name> — Retrieve a saved note."""
     args = message.text.split(None, 1)
     if len(args) < 2:
         return await message.reply_text("Usage: /get <name>")
@@ -765,7 +806,6 @@ async def cmd_get_note(_, message: types.Message):
 
 @app.on_message(filters.command("notes") & filters.group)
 async def cmd_list_notes(_, message: types.Message):
-    """List all saved notes."""
     notes = await db.get_all_notes(message.chat.id)
     if not notes:
         return await message.reply_text("📭 No notes saved in this group.")
@@ -791,7 +831,6 @@ async def cmd_clear_note(_, message: types.Message):
         await message.reply_text(f"❌ No note named <b>{args[1]}</b>.")
 
 
-# Hashtag note retrieval: #notename in chat
 @app.on_message(filters.group & filters.regex(r"^#(\w+)"))
 async def on_hashtag_note(_, message: types.Message):
     name = message.matches[0].group(1)
@@ -873,7 +912,7 @@ LOCK_TYPES = {
 
 @app.on_message(filters.command("lock") & filters.group)
 async def cmd_lock(_, message: types.Message):
-    """aa: /lock <type> — Lock a message type. Types: sticker gif link media poll all"""
+    """aa: /lock <type|all>"""
     if not await _assert_admin(message):
         return await message.reply_text("❌ Only group admins can lock.")
 
@@ -892,29 +931,33 @@ async def cmd_lock(_, message: types.Message):
         await db.add_lock(message.chat.id, lt)
 
     try:
-        chat = await app.get_chat(message.chat.id)
-        current = chat.permissions
+        chat_obj = await app.get_chat(message.chat.id)
+        current = chat_obj.permissions
         new_perms = enums.ChatPermissions(
-            can_send_messages=current.can_send_messages,
-            can_send_media_messages=False if lock_type in ("media", "all") else current.can_send_media_messages,
-            can_send_other_messages=False if lock_type in ("sticker", "gif", "poll", "all") else current.can_send_other_messages,
-            can_add_web_page_previews=False if lock_type in ("link", "all") else current.can_add_web_page_previews,
+            can_send_messages=current.can_send_messages if current else True,
+            can_send_media_messages=False if lock_type in ("media", "all") else (current.can_send_media_messages if current else True),
+            can_send_other_messages=False if lock_type in ("sticker", "gif", "poll", "all") else (current.can_send_other_messages if current else True),
+            can_add_web_page_previews=False if lock_type in ("link", "all") else (current.can_add_web_page_previews if current else True),
         )
         await app.set_chat_permissions(message.chat.id, new_perms)
         await message.reply_text(f"🔒 Locked: <b>{lock_type}</b>")
     except ChatAdminRequired:
         await message.reply_text("❌ I need admin permissions to change chat permissions.")
+    except Exception as e:
+        await message.reply_text(f"❌ Failed: {e}")
 
 
 @app.on_message(filters.command("unlock") & filters.group)
 async def cmd_unlock(_, message: types.Message):
-    """aa: /unlock <type>"""
+    """aa: /unlock <type|all>"""
     if not await _assert_admin(message):
         return await message.reply_text("❌ Only group admins can unlock.")
 
     args = message.text.split(None, 1)
     if len(args) < 2:
-        return await message.reply_text("Usage: /unlock <type>\nTypes: " + ", ".join(LOCK_TYPES.keys()) + ", all")
+        return await message.reply_text(
+            "Usage: /unlock <type>\nTypes: " + ", ".join(LOCK_TYPES.keys()) + ", all"
+        )
 
     lock_type = args[1].lower()
     to_unlock = list(LOCK_TYPES.keys()) if lock_type == "all" else [lock_type]
@@ -922,18 +965,12 @@ async def cmd_unlock(_, message: types.Message):
         await db.remove_lock(message.chat.id, lt)
 
     try:
-        await app.set_chat_permissions(
-            message.chat.id,
-            enums.ChatPermissions(
-                can_send_messages=True,
-                can_send_media_messages=True,
-                can_send_other_messages=True,
-                can_add_web_page_previews=True,
-            ),
-        )
+        await app.set_chat_permissions(message.chat.id, _default_perms())
         await message.reply_text(f"🔓 Unlocked: <b>{lock_type}</b>")
     except ChatAdminRequired:
         await message.reply_text("❌ I need admin permissions.")
+    except Exception as e:
+        await message.reply_text(f"❌ Failed: {e}")
 
 
 @app.on_message(filters.command("locks") & filters.group)
@@ -952,7 +989,7 @@ async def cmd_list_locks(_, message: types.Message):
 
 @app.on_message(filters.command("setflood") & filters.group)
 async def cmd_setflood(_, message: types.Message):
-    """aa: /setflood <number|off> — Set max messages before muting."""
+    """aa: /setflood <number|off>"""
     if not await _assert_admin(message):
         return await message.reply_text("❌ Only group admins.")
 
@@ -982,14 +1019,13 @@ async def cmd_flood(_, message: types.Message):
 
 @app.on_message(filters.group & ~filters.service)
 async def antiflood_check(_, message: types.Message):
-    """Automatically mutes users who send too many messages rapidly."""
+    """Auto-mute users who flood."""
     if not message.from_user:
         return
 
     chat_id = message.chat.id
     user_id = message.from_user.id
 
-    # Skip admins and bot
     if user_id == app.id:
         return
     if await is_admin(chat_id, user_id):
@@ -1007,16 +1043,9 @@ async def antiflood_check(_, message: types.Message):
     if _flood_count[chat_id][user_id] >= limit:
         _flood_count[chat_id][user_id] = 0
         try:
-            await app.restrict_chat_member(chat_id, user_id, enums.ChatPermissions())
+            await app.restrict_chat_member(chat_id, user_id, _muted_perms())
             await message.reply_text(
                 f"🚦 {_mention(message.from_user)} was <b>muted</b> for flooding."
-            )
-            await _log(
-                f"<b>🚦 Antiflood Mute</b>\n"
-                f"Chat: <b>{message.chat.title}</b>\n"
-                f"User: {_mention(message.from_user)} (<code>{user_id}</code>)\n"
-                f"Exceeded limit of {limit} messages\n"
-                f"Time: {_now()}"
             )
         except Exception:
             pass
@@ -1034,7 +1063,7 @@ async def cmd_promote(_, message: types.Message):
 
     target = await _get_target(message)
     if not target:
-        return await message.reply_text("❌ Reply to a user or provide @username/user_id.")
+        return await message.reply_text("❌ Reply to a user or provide @username / user_id.")
 
     try:
         await app.promote_chat_member(
@@ -1049,41 +1078,47 @@ async def cmd_promote(_, message: types.Message):
         )
         await message.reply_text(f"⬆️ {_mention(target)} has been <b>promoted</b>.")
         await _log(
-            f"<b>⬆️ User Promoted</b>\n"
-            f"Chat: <b>{message.chat.title}</b>\n"
+            f"<b>⬆️ User Promoted</b>\nChat: <b>{message.chat.title}</b>\n"
             f"User: {_mention(target)} (<code>{target.id}</code>)\n"
-            f"By: {_mention(message.from_user)}\n"
-            f"Time: {_now()}"
+            f"By: {_mention(message.from_user)}\nTime: {_now()}"
         )
     except ChatAdminRequired:
         await message.reply_text("❌ I need promote permissions.")
+    except Exception as e:
+        await message.reply_text(f"❌ Failed: {e}")
 
 
 @app.on_message(filters.command("demote") & filters.group)
 async def cmd_demote(_, message: types.Message):
-    """aa: Demote an admin to regular member."""
+    """aa: Demote an admin."""
     if not await _assert_admin(message):
         return await message.reply_text("❌ Only group admins can demote.")
 
     target = await _get_target(message)
     if not target:
-        return await message.reply_text("❌ Reply to a user or provide @username/user_id.")
+        return await message.reply_text("❌ Reply to a user or provide @username / user_id.")
 
     try:
         await app.promote_chat_member(
             message.chat.id, target.id,
-            privileges=types.ChatPrivileges(),
+            privileges=types.ChatPrivileges(
+                can_manage_chat=False,
+                can_delete_messages=False,
+                can_restrict_members=False,
+                can_invite_users=False,
+                can_pin_messages=False,
+            ),
         )
         await message.reply_text(f"⬇️ {_mention(target)} has been <b>demoted</b>.")
         await _log(
-            f"<b>⬇️ User Demoted</b>\n"
-            f"Chat: <b>{message.chat.title}</b>\n"
+            f"<b>⬇️ User Demoted</b>\nChat: <b>{message.chat.title}</b>\n"
             f"User: {_mention(target)} (<code>{target.id}</code>)\n"
-            f"By: {_mention(message.from_user)}\n"
-            f"Time: {_now()}"
+            f"By: {_mention(message.from_user)}\nTime: {_now()}"
         )
     except ChatAdminRequired:
         await message.reply_text("❌ I need promote permissions.")
+    except Exception as e:
+        await message.reply_text(f"❌ Failed: {e}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1100,35 +1135,66 @@ async def cmd_pin(_, message: types.Message):
         return await message.reply_text("❌ Reply to a message to pin it.")
 
     try:
-        await message.reply_to_message.pin()
+        await app.pin_chat_message(
+            message.chat.id,
+            message.reply_to_message.id,
+            disable_notification=False,
+        )
         await message.reply_text("📌 Message pinned.")
     except ChatAdminRequired:
-        await message.reply_text("❌ I need pin permissions.")
+        await message.reply_text("❌ I need 'Pin Messages' admin permission.")
+    except Exception as e:
+        await message.reply_text(f"❌ Failed: {e}")
 
 
 @app.on_message(filters.command("unpin") & filters.group)
 async def cmd_unpin(_, message: types.Message):
-    """aa: Unpin the pinned message."""
+    """aa: Unpin — reply to unpin a specific message, or use alone to unpin the last one."""
     if not await _assert_admin(message):
         return await message.reply_text("❌ Only group admins can unpin.")
 
     try:
-        await app.unpin_chat_message(message.chat.id)
+        if message.reply_to_message:
+            await app.unpin_chat_message(
+                message.chat.id, message_id=message.reply_to_message.id
+            )
+        else:
+            await app.unpin_chat_message(message.chat.id)
         await message.reply_text("📌 Message unpinned.")
     except ChatAdminRequired:
-        await message.reply_text("❌ I need pin permissions.")
+        await message.reply_text("❌ I need 'Pin Messages' admin permission.")
+    except Exception as e:
+        await message.reply_text(f"❌ Failed: {e}")
+
+
+@app.on_message(filters.command("unpinall") & filters.group)
+async def cmd_unpinall(_, message: types.Message):
+    """aa: Unpin all messages."""
+    if not await _assert_admin(message):
+        return await message.reply_text("❌ Only group admins can unpin all.")
+    try:
+        await app.unpin_all_chat_messages(message.chat.id)
+        await message.reply_text("📌 All messages unpinned.")
+    except ChatAdminRequired:
+        await message.reply_text("❌ I need 'Pin Messages' admin permission.")
+    except Exception as e:
+        await message.reply_text(f"❌ Failed: {e}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  CHAT INFO / USER INFO
+#  USER INFO / CHAT INFO
 # ═════════════════════════════════════════════════════════════════════════════
 
 @app.on_message(filters.command("info") & filters.group)
 async def cmd_info(_, message: types.Message):
-    """Get info about yourself or a replied user."""
+    """Get info about yourself or a replied/mentioned user."""
     target = await _get_target(message) or message.from_user
+    if not target:
+        return await message.reply_text("❌ Could not find that user.")
+
     chat = message.chat
 
+    status = "Unknown"
     try:
         member = await app.get_chat_member(chat.id, target.id)
         status = str(member.status).split(".")[-1].title()
@@ -1137,10 +1203,10 @@ async def cmd_info(_, message: types.Message):
     except Exception:
         status = "Unknown"
 
-    name = (target.first_name or "") + (" " + target.last_name if target.last_name else "")
     warns = await db.get_warns(chat.id, target.id)
     warn_limit = await db.get_warn_limit(chat.id)
     username = f"@{target.username}" if target.username else "N/A"
+    is_auth = await db.is_auth(chat.id, target.id)
 
     text = (
         f"👤 <b>User Info</b>\n\n"
@@ -1148,6 +1214,7 @@ async def cmd_info(_, message: types.Message):
         f"ID: <code>{target.id}</code>\n"
         f"Username: {username}\n"
         f"Status: {status}\n"
+        f"Authorised: {'✅' if is_auth else '❌'}\n"
         f"Warnings: {len(warns)}/{warn_limit}\n"
         f"Bot: {'Yes' if target.is_bot else 'No'}"
     )
@@ -1157,7 +1224,10 @@ async def cmd_info(_, message: types.Message):
 @app.on_message(filters.command("chatinfo") & filters.group)
 async def cmd_chatinfo(_, message: types.Message):
     chat = message.chat
-    count = await app.get_chat_members_count(chat.id)
+    try:
+        count = await app.get_chat_members_count(chat.id)
+    except Exception:
+        count = "Unknown"
     username = f"@{chat.username}" if chat.username else "Private"
     text = (
         f"💬 <b>Chat Info</b>\n\n"
@@ -1172,7 +1242,6 @@ async def cmd_chatinfo(_, message: types.Message):
 
 @app.on_message(filters.command("adminlist") & filters.group)
 async def cmd_adminlist(_, message: types.Message):
-    """List all admins in the group."""
     admins = await db.get_admins(message.chat.id, reload=True)
     if not admins:
         return await message.reply_text("❌ Couldn't fetch admin list.")
@@ -1201,69 +1270,83 @@ async def cmd_invite(_, message: types.Message):
         await message.reply_text(f"🔗 Invite link:\n{link}")
     except ChatAdminRequired:
         await message.reply_text("❌ I need invite link permission.")
+    except Exception as e:
+        await message.reply_text(f"❌ Failed: {e}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  HELP
-# ═════════════════════════════════════════════════════════════════════════════
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  ANTI-LINK  (auto-delete links; admins exempt)
+#  ANTI-LINK
 # ═════════════════════════════════════════════════════════════════════════════
 
 @app.on_message(filters.command("antilink") & filters.group)
 async def cmd_antilink(_, message: types.Message):
-    """aa: /antilink on|off — Toggle automatic link removal."""
+    """aa: /antilink on|off"""
     if not await _assert_admin(message):
         return await message.reply_text("❌ Only group admins.")
 
     args = message.text.split()
     if len(args) < 2 or args[1].lower() not in ("on", "off"):
         current = await db.get_antilink(message.chat.id)
-        status = "🔴 ON" if current else "🟢 OFF"
         return await message.reply_text(
-            f"🔗 Anti-link is currently <b>{status}</b>.\nUse /antilink on or /antilink off."
+            f"🔗 Anti-link is currently <b>{'ON 🔴' if current else 'OFF 🟢'}</b>.\n"
+            f"Use /antilink on or /antilink off."
         )
 
     enable = args[1].lower() == "on"
     await db.set_antilink(message.chat.id, enable)
     await message.reply_text(
-        f"✅ Anti-link <b>{'enabled' if enable else 'disabled'}</b>. "
-        f"{'Links will be deleted and non-admins warned.' if enable else 'Links are now allowed.'}"
+        f"✅ Anti-link <b>{'enabled 🔴' if enable else 'disabled 🟢'}</b>.\n"
+        + ("Links from non-admins will be deleted + warned." if enable else "Links are now allowed.")
     )
     await _log(
         f"<b>🔗 Anti-link {'ON' if enable else 'OFF'}</b>\n"
         f"Chat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
-        f"By: {_mention(message.from_user)}\n"
-        f"Time: {_now()}"
+        f"By: {_mention(message.from_user)}\nTime: {_now()}"
     )
 
 
 @app.on_message(filters.group & filters.text & ~filters.command([]))
 async def antilink_check(_, message: types.Message):
-    """Delete messages containing links if antilink is on and sender is not admin."""
+    """Delete messages containing URLs if antilink is on; admins exempt."""
     if not message.from_user:
         return
     if not await db.get_antilink(message.chat.id):
         return
-    if await is_admin(message.chat.id, message.from_user.id):
-        return
     if message.from_user.id in app.sudoers:
         return
+    if await is_admin(message.chat.id, message.from_user.id):
+        return
 
-    if message.text and _URL_RE.search(message.text):
+    if not (message.text and _URL_RE.search(message.text)):
+        return
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    count, limit = await _issue_warn(
+        message.chat.id, message.chat.title, message.from_user, message.from_user, "Sent a link"
+    )
+
+    if count >= limit:
         try:
-            await message.delete()
+            await app.ban_chat_member(message.chat.id, message.from_user.id)
+            await db.reset_warns(message.chat.id, message.from_user.id)
+            await app.send_message(
+                message.chat.id,
+                f"🚫 {_mention(message.from_user)} was <b>banned</b> for repeatedly sending links."
+            )
         except Exception:
             pass
-        warn_count = await db.warn_user(message.chat.id, message.from_user.id, "Sent a link")
-        limit = await db.get_warn_limit(message.chat.id)
-        sent = await message.reply_text(
-            f"🔗 {_mention(message.from_user)} links are not allowed here!\n"
-            f"⚠️ Warning <b>{warn_count}/{limit}</b>."
+    else:
+        sent = await app.send_message(
+            message.chat.id,
+            f"🔗 {_mention(message.from_user)}, links are not allowed here!\n"
+            f"⚠️ Warning <b>{count}/{limit}</b>.",
+            reply_markup=_warn_buttons(message.from_user.id),
         )
-        await asyncio.sleep(5)
+        await asyncio.sleep(10)
         try:
             await sent.delete()
         except Exception:
@@ -1271,54 +1354,52 @@ async def antilink_check(_, message: types.Message):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  ANTI-FORWARD  (delete forwarded messages; admins exempt)
+#  ANTI-FORWARD
 # ═════════════════════════════════════════════════════════════════════════════
 
 @app.on_message(filters.command("antiforward") & filters.group)
 async def cmd_antiforward(_, message: types.Message):
-    """aa: /antiforward on|off — Toggle deletion of forwarded messages."""
+    """aa: /antiforward on|off"""
     if not await _assert_admin(message):
         return await message.reply_text("❌ Only group admins.")
 
     args = message.text.split()
     if len(args) < 2 or args[1].lower() not in ("on", "off"):
         current = await db.get_antiforward(message.chat.id)
-        status = "🔴 ON" if current else "🟢 OFF"
         return await message.reply_text(
-            f"↩️ Anti-forward is currently <b>{status}</b>.\nUse /antiforward on or /antiforward off."
+            f"↩️ Anti-forward is currently <b>{'ON 🔴' if current else 'OFF 🟢'}</b>.\n"
+            f"Use /antiforward on or /antiforward off."
         )
 
     enable = args[1].lower() == "on"
     await db.set_antiforward(message.chat.id, enable)
-    await message.reply_text(
-        f"✅ Anti-forward <b>{'enabled' if enable else 'disabled'}</b>."
-    )
+    await message.reply_text(f"✅ Anti-forward <b>{'enabled 🔴' if enable else 'disabled 🟢'}</b>.")
     await _log(
         f"<b>↩️ Anti-forward {'ON' if enable else 'OFF'}</b>\n"
         f"Chat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
-        f"By: {_mention(message.from_user)}\n"
-        f"Time: {_now()}"
+        f"By: {_mention(message.from_user)}\nTime: {_now()}"
     )
 
 
 @app.on_message(filters.group & filters.forwarded)
 async def antiforward_check(_, message: types.Message):
-    """Delete forwarded messages if antiforward is on and sender is not admin."""
+    """Delete forwarded messages if antiforward is on; admins exempt."""
     if not message.from_user:
         return
     if not await db.get_antiforward(message.chat.id):
         return
-    if await is_admin(message.chat.id, message.from_user.id):
-        return
     if message.from_user.id in app.sudoers:
+        return
+    if await is_admin(message.chat.id, message.from_user.id):
         return
 
     try:
         await message.delete()
     except Exception:
         pass
-    sent = await message.reply_text(
-        f"↩️ {_mention(message.from_user)} forwarded messages are not allowed here!"
+    sent = await app.send_message(
+        message.chat.id,
+        f"↩️ {_mention(message.from_user)}, forwarded messages are not allowed here!"
     )
     await asyncio.sleep(5)
     try:
@@ -1328,51 +1409,37 @@ async def antiforward_check(_, message: types.Message):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  ANTI-WORDS  (banned words managed by admin via bot DM)
+#  ANTI-WORDS  (managed by admin via bot DM)
 # ═════════════════════════════════════════════════════════════════════════════
-# Admins set banned words by DMing the bot.
-# /setantiword <chat_id> <word>
-# /delantiword <chat_id> <word>
-# /listantiwords <chat_id>
 
 @app.on_message(filters.private & filters.command("setantiword"))
 async def cmd_set_antiword(_, message: types.Message):
-    """Admin DM: /setantiword <chat_id> <word> — Add a banned word for a group."""
-    if message.from_user.id not in app.sudoers:
-        if not hasattr(app, "_antiword_admins"):
-            app._antiword_admins = set()
-        # Allow group admins who have previously verified
-        pass
-
+    """DM: /setantiword <chat_id> <word>"""
     args = message.text.split(None, 2)
     if len(args) < 3:
         return await message.reply_text(
-            "Usage: /setantiword <chat_id> <word>\n"
-            "Example: /setantiword -1001234567890 badword"
+            "📝 Usage: /setantiword <chat_id> <word>\nExample: /setantiword -1001234567890 badword"
         )
-
     try:
         chat_id = int(args[1])
     except ValueError:
         return await message.reply_text("❌ Invalid chat ID.")
 
-    # Verify sender is admin of that group
     if message.from_user.id not in app.sudoers:
         if not await is_admin(chat_id, message.from_user.id):
             return await message.reply_text("❌ You are not an admin of that group.")
 
     word = args[2].lower().strip()
     await db.add_antiword(chat_id, word)
-    await message.reply_text(f"✅ Word <code>{word}</code> added to banned list for chat <code>{chat_id}</code>.")
+    await message.reply_text(f"✅ Word <code>{word}</code> added to banned list for <code>{chat_id}</code>.")
 
 
 @app.on_message(filters.private & filters.command("delantiword"))
 async def cmd_del_antiword(_, message: types.Message):
-    """Admin DM: /delantiword <chat_id> <word> — Remove a banned word."""
+    """DM: /delantiword <chat_id> <word>"""
     args = message.text.split(None, 2)
     if len(args) < 3:
         return await message.reply_text("Usage: /delantiword <chat_id> <word>")
-
     try:
         chat_id = int(args[1])
     except ValueError:
@@ -1382,21 +1449,19 @@ async def cmd_del_antiword(_, message: types.Message):
         if not await is_admin(chat_id, message.from_user.id):
             return await message.reply_text("❌ You are not an admin of that group.")
 
-    word = args[2].lower().strip()
-    removed = await db.remove_antiword(chat_id, word)
+    removed = await db.remove_antiword(chat_id, args[2].lower().strip())
     if removed:
-        await message.reply_text(f"✅ Word <code>{word}</code> removed.")
+        await message.reply_text(f"✅ Word removed.")
     else:
-        await message.reply_text(f"❌ Word <code>{word}</code> not found in the list.")
+        await message.reply_text(f"❌ Word not found in the list.")
 
 
 @app.on_message(filters.private & filters.command("listantiwords"))
 async def cmd_list_antiwords(_, message: types.Message):
-    """Admin DM: /listantiwords <chat_id> — List all banned words for a group."""
+    """DM: /listantiwords <chat_id>"""
     args = message.text.split(None, 1)
     if len(args) < 2:
         return await message.reply_text("Usage: /listantiwords <chat_id>")
-
     try:
         chat_id = int(args[1])
     except ValueError:
@@ -1408,7 +1473,7 @@ async def cmd_list_antiwords(_, message: types.Message):
 
     words = await db.get_antiwords(chat_id)
     if not words:
-        return await message.reply_text(f"📭 No banned words for chat <code>{chat_id}</code>.")
+        return await message.reply_text(f"📭 No banned words for <code>{chat_id}</code>.")
     await message.reply_text(
         f"🚫 <b>Banned words for {chat_id}:</b>\n" +
         "\n".join(f"• <code>{w}</code>" for w in words)
@@ -1417,11 +1482,10 @@ async def cmd_list_antiwords(_, message: types.Message):
 
 @app.on_message(filters.private & filters.command("clearantiwords"))
 async def cmd_clear_antiwords(_, message: types.Message):
-    """Admin DM: /clearantiwords <chat_id> — Clear all banned words."""
+    """DM: /clearantiwords <chat_id>"""
     args = message.text.split(None, 1)
     if len(args) < 2:
         return await message.reply_text("Usage: /clearantiwords <chat_id>")
-
     try:
         chat_id = int(args[1])
     except ValueError:
@@ -1437,12 +1501,12 @@ async def cmd_clear_antiwords(_, message: types.Message):
 
 @app.on_message(filters.group & filters.text & ~filters.command([]))
 async def antiword_check(_, message: types.Message):
-    """Delete messages containing banned words and warn the user."""
+    """Delete messages containing banned words and warn the sender."""
     if not message.from_user:
         return
-    if await is_admin(message.chat.id, message.from_user.id):
-        return
     if message.from_user.id in app.sudoers:
+        return
+    if await is_admin(message.chat.id, message.from_user.id):
         return
 
     words = await db.get_antiwords(message.chat.id)
@@ -1459,80 +1523,38 @@ async def antiword_check(_, message: types.Message):
     except Exception:
         pass
 
-    warn_count = await db.warn_user(message.chat.id, message.from_user.id, f"Used banned word: {hit}")
-    limit = await db.get_warn_limit(message.chat.id)
-
-    # Build message with admin-only remove-warn button
-    btn = types.InlineKeyboardMarkup([[
-        types.InlineKeyboardButton("✅ Remove Warn", callback_data=f"rmwarn_{message.from_user.id}")
-    ]])
-
-    sent = await app.send_message(
-        message.chat.id,
-        f"🚫 {_mention(message.from_user)} your message contained a banned word.\n"
-        f"⚠️ Warning <b>{warn_count}/{limit}</b>.",
-        reply_markup=btn,
+    count, limit = await _issue_warn(
+        message.chat.id, message.chat.title,
+        message.from_user, message.from_user,
+        f"Used banned word: {hit}"
     )
 
-    if warn_count >= limit:
+    if count >= limit:
         try:
             await app.ban_chat_member(message.chat.id, message.from_user.id)
             await db.reset_warns(message.chat.id, message.from_user.id)
-            await sent.edit_text(
-                f"🚫 {_mention(message.from_user)} reached the warn limit and has been <b>banned</b>.",
+            await app.send_message(
+                message.chat.id,
+                f"🚫 {_mention(message.from_user)} was <b>banned</b> for using banned words repeatedly."
             )
         except Exception:
             pass
-
-
-@app.on_callback_query(filters.regex(r"^rmwarn_(\d+)$"))
-async def cb_remove_warn(_, query: types.CallbackQuery):
-    """Admin-only button to remove a warning issued for anti-word."""
-    chat = query.message.chat
-    if not await is_admin(chat.id, query.from_user.id):
-        return await query.answer("❌ Only admins can remove warnings.", show_alert=True)
-
-    target_id = int(query.matches[0].group(1))
-    warns = await db.get_warns(chat.id, target_id)
-    if not warns:
-        return await query.answer("✅ User already has no warnings.", show_alert=True)
-
-    # Remove last warning
-    warns.pop()
-    await db.db.warns.update_one(
-        {"_id": f"{chat.id}:{target_id}"},
-        {"$set": {"warns": warns}},
-        upsert=True,
-    )
-    await query.answer("✅ One warning removed.", show_alert=True)
-    try:
-        limit = await db.get_warn_limit(chat.id)
-        await query.message.edit_reply_markup(
-            types.InlineKeyboardMarkup([[
-                types.InlineKeyboardButton(
-                    f"✅ Warn removed by {query.from_user.first_name} ({len(warns)}/{limit})",
-                    callback_data="noop"
-                )
-            ]])
+    else:
+        await app.send_message(
+            message.chat.id,
+            f"🚫 {_mention(message.from_user)}, that word is not allowed here!\n"
+            f"⚠️ Warning <b>{count}/{limit}</b>.",
+            reply_markup=_warn_buttons(message.from_user.id),
         )
-    except Exception:
-        pass
-    await _log(
-        f"<b>✅ Warn Removed via Button</b>\n"
-        f"Chat: <b>{chat.title}</b> (<code>{chat.id}</code>)\n"
-        f"Target ID: <code>{target_id}</code>\n"
-        f"By: {_mention(query.from_user)}\n"
-        f"Time: {_now()}"
-    )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  TAGALL  (mention all members)
+#  TAG ALL
 # ═════════════════════════════════════════════════════════════════════════════
 
 @app.on_message(filters.command("tagall") & filters.group)
 async def cmd_tagall(_, message: types.Message):
-    """bb: /tagall [message] — Tag all members in the group."""
+    """bb: /tagall [message] — Mention all members."""
     if not await _assert_bb(message):
         return await message.reply_text("❌ Admins/authorised users only.")
 
@@ -1540,24 +1562,31 @@ async def cmd_tagall(_, message: types.Message):
     header = args[1] if len(args) > 1 else "📣 Attention everyone!"
 
     members = []
-    async for member in app.get_chat_members(message.chat.id):
-        if not member.user.is_bot and not member.user.is_deleted:
-            members.append(member.user)
+    try:
+        async for member in app.get_chat_members(message.chat.id):
+            if not member.user.is_bot and not member.user.is_deleted:
+                members.append(member.user)
+    except Exception as e:
+        return await message.reply_text(f"❌ Couldn't fetch members: {e}")
 
     if not members:
         return await message.reply_text("❌ No members found.")
 
-    # Send in chunks of 5 mentions per message to avoid flood
-    chunk_size = 5
     await message.reply_text(f"<b>{header}</b>")
+
+    chunk_size = 5
     for i in range(0, len(members), chunk_size):
         chunk = members[i:i + chunk_size]
         mentions = "  ".join(
             f'<a href="tg://user?id={u.id}">{u.first_name or u.id}</a>'
             for u in chunk
         )
-        await app.send_message(message.chat.id, mentions)
-        await asyncio.sleep(0.5)
+        try:
+            await app.send_message(message.chat.id, mentions)
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+            await app.send_message(message.chat.id, mentions)
+        await asyncio.sleep(0.4)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1566,63 +1595,64 @@ async def cmd_tagall(_, message: types.Message):
 
 @app.on_message(filters.command("captcha") & filters.group)
 async def cmd_captcha(_, message: types.Message):
-    """aa: /captcha on|off — Toggle captcha verification for new members."""
+    """aa: /captcha on|off"""
     if not await _assert_admin(message):
         return await message.reply_text("❌ Only group admins.")
 
     args = message.text.split()
     if len(args) < 2 or args[1].lower() not in ("on", "off"):
         current = await db.get_captcha(message.chat.id)
-        status = "🔴 ON" if current else "🟢 OFF"
         return await message.reply_text(
-            f"🔐 Captcha is currently <b>{status}</b>.\nUse /captcha on or /captcha off."
+            f"🔐 Captcha is currently <b>{'ON 🔴' if current else 'OFF 🟢'}</b>.\n"
+            f"Use /captcha on or /captcha off."
         )
 
     enable = args[1].lower() == "on"
     await db.set_captcha(message.chat.id, enable)
     await message.reply_text(
-        f"✅ Captcha <b>{'enabled' if enable else 'disabled'}</b>."
+        f"✅ Captcha <b>{'enabled 🔴' if enable else 'disabled 🟢'}</b>."
+        + ("\nNew members will be muted until they solve a math question." if enable else "")
     )
 
 
 async def _send_captcha(chat: types.Chat, user: types.User) -> None:
-    """Mute the new user and send them a math captcha to solve."""
-    # Mute until verified
+    """Mute new user and send them a math captcha."""
     try:
-        await app.restrict_chat_member(
-            chat.id,
-            user.id,
-            enums.ChatPermissions(
-                can_send_messages=False,
-                can_send_media_messages=False,
-                can_send_other_messages=False,
-                can_add_web_page_previews=False,
-            ),
-        )
+        await app.restrict_chat_member(chat.id, user.id, _muted_perms())
     except Exception:
-        return
+        return  # If we can't restrict, skip captcha
 
-    # Generate a simple math question
     a, b = random.randint(1, 15), random.randint(1, 15)
     answer = a + b
-    wrong = [answer + random.randint(1, 5), answer - random.randint(1, 5), answer + random.randint(6, 12)]
-    random.shuffle(wrong)
-    options = wrong[:3] + [answer]
+
+    # 3 wrong answers + 1 correct, shuffled
+    wrong = set()
+    while len(wrong) < 3:
+        w = answer + random.randint(-10, 10)
+        if w != answer and w > 0:
+            wrong.add(w)
+    options = list(wrong) + [answer]
     random.shuffle(options)
 
     buttons = types.InlineKeyboardMarkup([[
-        types.InlineKeyboardButton(str(opt), callback_data=f"captcha_{user.id}_{opt}_{answer}")
+        types.InlineKeyboardButton(
+            str(opt),
+            callback_data=f"cap_{user.id}_{opt}_{answer}"
+        )
         for opt in options
     ]])
 
-    sent = await app.send_message(
-        chat.id,
-        f"🔐 Welcome {_mention(user)}!\n"
-        f"Please solve this to verify you're human:\n\n"
-        f"<b>{a} + {b} = ?</b>\n\n"
-        f"You have <b>60 seconds</b> or you will be kicked.",
-        reply_markup=buttons,
-    )
+    try:
+        sent = await app.send_message(
+            chat.id,
+            f"🔐 Welcome {_mention(user)}!\n\n"
+            f"Please solve this to verify you're human and gain access:\n\n"
+            f"<b>{a} + {b} = ?</b>\n\n"
+            f"⏳ You have <b>60 seconds</b> or you will be kicked.",
+            reply_markup=buttons,
+        )
+    except Exception:
+        return
 
     if chat.id not in _captcha_pending:
         _captcha_pending[chat.id] = {}
@@ -1631,18 +1661,18 @@ async def _send_captcha(chat: types.Chat, user: types.User) -> None:
     # Auto-kick after 60s if not verified
     await asyncio.sleep(60)
     if chat.id in _captcha_pending and user.id in _captcha_pending[chat.id]:
-        _captcha_pending[chat.id].pop(user.id)
+        _captcha_pending[chat.id].pop(user.id, None)
         try:
             await app.ban_chat_member(chat.id, user.id)
-            await app.unban_chat_member(chat.id, user.id)  # kick, not ban
+            await app.unban_chat_member(chat.id, user.id)
             await sent.edit_text(
-                f"⏰ {_mention(user)} failed captcha and was kicked."
+                f"⏰ {_mention(user)} failed to solve the captcha and was <b>kicked</b>."
             )
         except Exception:
             pass
 
 
-@app.on_callback_query(filters.regex(r"^captcha_(\d+)_(\d+)_(\d+)$"))
+@app.on_callback_query(filters.regex(r"^cap_(\d+)_(\d+)_(\d+)$"))
 async def cb_captcha(_, query: types.CallbackQuery):
     """Handle captcha button presses."""
     user_id = int(query.matches[0].group(1))
@@ -1650,7 +1680,6 @@ async def cb_captcha(_, query: types.CallbackQuery):
     answer = int(query.matches[0].group(3))
     chat = query.message.chat
 
-    # Only the target user can answer
     if query.from_user.id != user_id:
         return await query.answer("❌ This captcha is not for you!", show_alert=True)
 
@@ -1660,111 +1689,110 @@ async def cb_captcha(_, query: types.CallbackQuery):
             _captcha_pending[chat.id].pop(user_id, None)
 
         try:
-            default = (await app.get_chat(chat.id)).permissions
-            await app.restrict_chat_member(
-                chat.id,
-                user_id,
-                default or enums.ChatPermissions(
-                    can_send_messages=True,
-                    can_send_media_messages=True,
-                    can_send_other_messages=True,
-                    can_add_web_page_previews=True,
-                ),
-            )
+            chat_obj = await app.get_chat(chat.id)
+            perms = chat_obj.permissions or _default_perms()
+            await app.restrict_chat_member(chat.id, user_id, perms)
         except Exception:
             pass
 
-        await query.message.edit_text(
-            f"✅ {_mention(query.from_user)} passed the captcha! Welcome to <b>{chat.title}</b>. 🎉"
-        )
+        try:
+            await query.message.edit_text(
+                f"✅ {_mention(query.from_user)} passed the captcha! "
+                f"Welcome to <b>{chat.title}</b>! 🎉"
+            )
+        except Exception:
+            pass
+        await query.answer("✅ Correct! Welcome!", show_alert=True)
     else:
-        # Wrong answer
         await query.answer("❌ Wrong answer! Try again.", show_alert=True)
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  HELP
+# ═════════════════════════════════════════════════════════════════════════════
 
 GMGMT_HELP = """
 <b>🛡 Group Management Commands</b>
 
-<b>─── Welcome / Goodbye (aa = group admin) ───</b>
+<b>── Welcome / Goodbye (aa) ──</b>
 /setwelcome &lt;text&gt; — Set welcome message (reply to photo for custom image)
-/setwelcome &lt;secs&gt; &lt;text&gt; — Set welcome + auto-delete delay
+/setwelcome &lt;secs&gt; &lt;text&gt; — With auto-delete timer
 /delwelcome — Remove welcome message
-/setgoodbye &lt;text&gt; — Set goodbye message (reply to photo for custom image)
+/setgoodbye &lt;text&gt; — Set goodbye message
 /delgoodbye — Remove goodbye message
-
 Variables: {mention} {first} {last} {title} {id}
 
-<b>─── Moderation (bb = admin / authorised) ───</b>
-/ban — Ban a user (reply or @username)
+<b>── Moderation (bb) ──</b>
+/ban — Ban a user
 /unban — Unban a user
-/kick — Kick (removable ban)
+/kick — Kick a user
 /mute — Mute a user
 /unmute — Unmute a user
 /tmute &lt;10m|2h|1d&gt; — Temp mute
 
-<b>─── Messages ───</b>
+<b>── Messages (bb) ──</b>
 /del — Delete replied message
-/purge — Purge from replied msg to this msg
-/delall — Delete all msgs from a user
+/purge — Purge from replied to current
+/delall — Delete last 3000 msgs from a user
 
-<b>─── Warnings ───</b>
-/warn [reason] — Warn a user (ban at limit)
-/warns — Show user's warnings
+<b>── Warnings (bb) ──</b>
+/warn [reason] — Warn (auto-ban at limit) + inline remove button
+/warns — Show warnings
 /resetwarn — Clear all warnings
 /setwarnlimit &lt;n&gt; — Set warn limit (aa)
 
-<b>─── Notes ───</b>
-/save &lt;name&gt; &lt;text&gt; — Save a note (aa)
-/get &lt;name&gt; — Retrieve a note
-#notename — Auto-retrieve note by hashtag
+<b>── Notes (aa) ──</b>
+/save &lt;name&gt; &lt;text&gt; — Save a note
+/get &lt;name&gt; — Get a note
+#notename — Auto-get by hashtag
 /notes — List all notes
-/clear &lt;name&gt; — Delete a note (aa)
+/clear &lt;name&gt; — Delete a note
 
-<b>─── Filters ───</b>
-/filter &lt;keyword&gt; &lt;reply&gt; — Add auto-reply (aa)
+<b>── Filters (aa) ──</b>
+/filter &lt;keyword&gt; &lt;reply&gt; — Add auto-reply
 /filters — List filters
-/stopfilter &lt;keyword&gt; — Remove filter (aa)
+/stopfilter &lt;keyword&gt; — Remove filter
 
-<b>─── Anti-Link (aa) ───</b>
-/antilink on|off — Auto-delete links (admins exempt)
+<b>── Anti-Link (aa) ──</b>
+/antilink on|off — Delete links from non-admins + warn
 
-<b>─── Anti-Forward (aa) ───</b>
-/antiforward on|off — Auto-delete forwarded messages (admins exempt)
+<b>── Anti-Forward (aa) ──</b>
+/antiforward on|off — Delete forwarded messages from non-admins
 
-<b>─── Anti-Words (via bot DM) ───</b>
-/setantiword &lt;chat_id&gt; &lt;word&gt; — Add banned word
-/delantiword &lt;chat_id&gt; &lt;word&gt; — Remove banned word
-/listantiwords &lt;chat_id&gt; — List banned words
-/clearantiwords &lt;chat_id&gt; — Clear all banned words
-⚠️ Violations: message deleted + warn issued + admin remove-warn button shown
+<b>── Anti-Words (bot DM) ──</b>
+/setantiword &lt;chat_id&gt; &lt;word&gt;
+/delantiword &lt;chat_id&gt; &lt;word&gt;
+/listantiwords &lt;chat_id&gt;
+/clearantiwords &lt;chat_id&gt;
 
-<b>─── Locks (aa) ───</b>
-/lock &lt;type|all&gt; — Lock message type
-/unlock &lt;type|all&gt; — Unlock
+<b>── Locks (aa) ──</b>
+/lock &lt;type|all&gt; — Lock: sticker gif link media poll all
+/unlock &lt;type|all&gt;
 /locks — Show active locks
-Types: sticker, gif, link, media, poll, all
 
-<b>─── AntiFlood (aa) ───</b>
-/setflood &lt;n|off&gt; — Set flood limit
-/flood — Show current limit
+<b>── AntiFlood (aa) ──</b>
+/setflood &lt;n|off&gt;
+/flood — Show limit
 
-<b>─── Admin Tools (aa) ───</b>
-/promote — Promote user to admin
+<b>── Admin Tools (aa) ──</b>
+/promote — Promote to admin
 /demote — Demote admin
 /pin — Pin replied message
-/unpin — Unpin message
+/unpin — Unpin (reply = specific, alone = last)
+/unpinall — Unpin all messages
 /invitelink — Generate invite link
 
-<b>─── Tag All (bb) ───</b>
+<b>── Tag All (bb) ──</b>
 /tagall [message] — Mention all members
 
-<b>─── Captcha (aa) ───</b>
+<b>── Captcha (aa) ──</b>
 /captcha on|off — Math captcha for new members (auto-kick on timeout)
 
-<b>─── Info ───</b>
+<b>── Info ──</b>
 /info — User info
 /chatinfo — Chat info
-/adminlist — List all admins
+/adminlist — List admins
+/gmhelp — This help message
 """
 
 
