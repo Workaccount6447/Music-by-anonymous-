@@ -5,7 +5,7 @@
 
 from functools import wraps
 
-from pyrogram import StopPropagation, enums, types
+from pyrogram import enums, types
 
 from anony import app, db
 
@@ -79,7 +79,7 @@ async def is_admin(chat_id: int, user_id: int) -> bool:
             enums.ChatMemberStatus.OWNER,
         ]
     except Exception:
-        raise StopPropagation
+        return False
 
 
 async def reload_admins(chat_id: int) -> list[int]:
