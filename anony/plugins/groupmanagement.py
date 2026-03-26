@@ -10,6 +10,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
+import random
+import re
+import string
 from datetime import datetime
 
 from pyrogram import enums, filters, types
@@ -21,6 +24,16 @@ from pyrogram.errors import (
 
 from anony import app, config, db
 from anony.helpers._admins import is_admin
+
+# ─── URL regex ───────────────────────────────────────────────────────────────
+_URL_RE = re.compile(
+    r"(https?://|www\.|t\.me/|@\w+\.\w+)"
+    r"|(\b\w[\w-]*\.(com|net|org|io|me|ly|co|gg|tv|xyz|info|biz|app|dev)\b)",
+    re.IGNORECASE,
+)
+
+# ─── In-memory captcha store: {chat_id: {user_id: {"code": str, "msg_id": int}}} ──
+_captcha_pending: dict[int, dict[int, dict]] = {}
 
 # ─── Flood tracker (in-memory, per chat) ─────────────────────────────────────
 _flood_count: dict[int, dict[int, int]] = {}   # {chat_id: {user_id: count}}
@@ -93,7 +106,7 @@ async def _only_groups(message: types.Message) -> bool:
 
 @app.on_message(filters.command("setwelcome") & filters.group)
 async def cmd_set_welcome(_, message: types.Message):
-    """aa: /setwelcome <text>  [reply to set delete timer: /setwelcome 30 <text>]"""
+    """aa: /setwelcome <text>  — optionally reply to a photo to set custom welcome photo."""
     if not await _assert_admin(message):
         return await message.reply_text("❌ Only group admins can set the welcome message.")
 
@@ -104,7 +117,8 @@ async def cmd_set_welcome(_, message: types.Message):
             "<code>/setwelcome Hello {mention}! Welcome to {title}.</code>\n\n"
             "Variables: <code>{mention}</code> <code>{first}</code> <code>{last}</code> <code>{title}</code> <code>{id}</code>\n\n"
             "To auto-delete the welcome message after N seconds:\n"
-            "<code>/setwelcome 60 Hello {mention}!</code>"
+            "<code>/setwelcome 60 Hello {mention}!</code>\n\n"
+            "To set a custom photo, reply to a photo while running this command."
         )
 
     parts = args[1].split(None, 1)
@@ -118,10 +132,19 @@ async def cmd_set_welcome(_, message: types.Message):
     if not text:
         return await message.reply_text("❌ Please provide the welcome message text.")
 
-    await db.set_welcome(message.chat.id, text, delete_after)
-    resp = f"✅ Welcome message saved."
+    # Check if replying to a photo
+    photo_url = None
+    if message.reply_to_message and message.reply_to_message.photo:
+        photo_url = message.reply_to_message.photo.file_id
+
+    await db.set_welcome(message.chat.id, text, delete_after, photo_url)
+    resp = "✅ Welcome message saved."
     if delete_after:
-        resp += f"\n⏳ It will be auto-deleted after <b>{delete_after}s</b>."
+        resp += f"\n⏳ Auto-delete after <b>{delete_after}s</b>."
+    if photo_url:
+        resp += "\n🖼 Custom photo saved."
+    else:
+        resp += f"\n🖼 Using default photo from config."
     await message.reply_text(resp)
 
     await _log(
@@ -151,7 +174,7 @@ async def cmd_del_welcome(_, message: types.Message):
 
 @app.on_message(filters.command("setgoodbye") & filters.group)
 async def cmd_set_goodbye(_, message: types.Message):
-    """aa: /setgoodbye <text>"""
+    """aa: /setgoodbye <text> — reply to a photo to set custom goodbye photo."""
     if not await _assert_admin(message):
         return await message.reply_text("❌ Only group admins can set the goodbye message.")
 
@@ -159,11 +182,22 @@ async def cmd_set_goodbye(_, message: types.Message):
     if len(args) < 2:
         return await message.reply_text(
             "📝 Usage: <code>/setgoodbye Goodbye {first}! We'll miss you.</code>\n\n"
-            "Variables: <code>{mention}</code> <code>{first}</code> <code>{last}</code> <code>{title}</code> <code>{id}</code>"
+            "Variables: <code>{mention}</code> <code>{first}</code> <code>{last}</code> <code>{title}</code> <code>{id}</code>\n\n"
+            "Reply to a photo while running this command to set a custom goodbye photo."
         )
 
-    await db.set_goodbye(message.chat.id, args[1])
-    await message.reply_text("✅ Goodbye message saved.")
+    photo_url = None
+    if message.reply_to_message and message.reply_to_message.photo:
+        photo_url = message.reply_to_message.photo.file_id
+
+    await db.set_goodbye(message.chat.id, args[1], photo_url)
+    resp = "✅ Goodbye message saved."
+    if photo_url:
+        resp += "\n🖼 Custom photo saved."
+    else:
+        resp += "\n🖼 Using default photo from config."
+    await message.reply_text(resp)
+
     await _log(
         f"<b>🔴 Goodbye Set</b>\n"
         f"Chat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
@@ -207,32 +241,56 @@ async def on_member_update(_, update: types.ChatMemberUpdated):
 
     user = update.new_chat_member.user if update.new_chat_member else update.old_chat_member.user
 
-    # User joined
+    # ── User joined ──────────────────────────────────────────────────────────
     if new_status == enums.ChatMemberStatus.MEMBER and old_status not in (
         enums.ChatMemberStatus.MEMBER,
         enums.ChatMemberStatus.ADMINISTRATOR,
         enums.ChatMemberStatus.OWNER,
     ):
-        data = await db.get_welcome(chat.id)
-        if data.get("text"):
-            text = _format_greeting(data["text"], user, chat)
-            sent = await app.send_message(chat.id, text)
-            if data.get("delete_after"):
-                await asyncio.sleep(data["delete_after"])
-                try:
-                    await sent.delete()
-                except Exception:
-                    pass
+        # Captcha check
+        if await db.get_captcha(chat.id):
+            await _send_captcha(chat, user)
 
-    # User left / was kicked
+        data = await db.get_welcome(chat.id)
+        # Use custom text if set, else fall back to config default
+        raw_text = data.get("text") or config.WELCOME_TEXT
+        photo = data.get("photo") or config.WELCOME_PHOTO
+        text = _format_greeting(raw_text, user, chat)
+
+        try:
+            sent = await app.send_photo(
+                chat.id,
+                photo=photo,
+                caption=text,
+            )
+        except Exception:
+            # If photo fails, send plain text
+            sent = await app.send_message(chat.id, text)
+
+        delete_after = data.get("delete_after", 0)
+        if delete_after:
+            await asyncio.sleep(delete_after)
+            try:
+                await sent.delete()
+            except Exception:
+                pass
+
+    # ── User left / kicked ───────────────────────────────────────────────────
     elif new_status in (enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED) and old_status in (
         enums.ChatMemberStatus.MEMBER,
         enums.ChatMemberStatus.ADMINISTRATOR,
         enums.ChatMemberStatus.OWNER,
     ):
-        text = await db.get_goodbye(chat.id)
-        if text:
-            await app.send_message(chat.id, _format_greeting(text, user, chat))
+        data = await db.get_goodbye(chat.id)
+        raw_text = data.get("text") if isinstance(data, dict) else data
+        raw_text = raw_text or config.GOODBYE_TEXT
+        photo = (data.get("photo") if isinstance(data, dict) else None) or config.WELCOME_PHOTO
+        text = _format_greeting(raw_text, user, chat)
+
+        try:
+            await app.send_photo(chat.id, photo=photo, caption=text)
+        except Exception:
+            await app.send_message(chat.id, text)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -367,7 +425,12 @@ async def cmd_mute(_, message: types.Message):
         await app.restrict_chat_member(
             message.chat.id,
             target.id,
-            enums.ChatPermissions(),  # All permissions False = muted
+            enums.ChatPermissions(
+                can_send_messages=False,
+                can_send_media_messages=False,
+                can_send_other_messages=False,
+                can_add_web_page_previews=False,
+            ),
         )
         await db.mute_user(message.chat.id, target.id)
         await message.reply_text(f"🔇 {_mention(target)} has been <b>muted</b>.")
@@ -427,7 +490,12 @@ async def cmd_tmute(_, message: types.Message):
         return await message.reply_text("❌ Reply to a user or provide @username/user_id.")
 
     args = message.text.split()
-    time_str = args[-1] if len(args) >= 2 else ""
+    # Find the time argument regardless of position (works with reply or @username)
+    time_str = ""
+    for a in args[1:]:
+        if _parse_time(a):
+            time_str = a
+            break
     seconds = _parse_time(time_str)
     if not seconds:
         return await message.reply_text("❌ Invalid time. Examples: <code>10m</code>, <code>2h</code>, <code>1d</code>")
@@ -1072,15 +1140,14 @@ async def cmd_info(_, message: types.Message):
     name = (target.first_name or "") + (" " + target.last_name if target.last_name else "")
     warns = await db.get_warns(chat.id, target.id)
     warn_limit = await db.get_warn_limit(chat.id)
+    username = f"@{target.username}" if target.username else "N/A"
 
     text = (
         f"👤 <b>User Info</b>\n\n"
         f"Name: {_mention(target)}\n"
         f"ID: <code>{target.id}</code>\n"
-        f"Username: @{target.username}" if target.username else f"Username: N/A"
-    )
-    text += (
-        f"\nStatus: {status}\n"
+        f"Username: {username}\n"
+        f"Status: {status}\n"
         f"Warnings: {len(warns)}/{warn_limit}\n"
         f"Bot: {'Yes' if target.is_bot else 'No'}"
     )
@@ -1091,13 +1158,14 @@ async def cmd_info(_, message: types.Message):
 async def cmd_chatinfo(_, message: types.Message):
     chat = message.chat
     count = await app.get_chat_members_count(chat.id)
+    username = f"@{chat.username}" if chat.username else "Private"
     text = (
         f"💬 <b>Chat Info</b>\n\n"
         f"Name: <b>{chat.title}</b>\n"
         f"ID: <code>{chat.id}</code>\n"
         f"Type: {str(chat.type).split('.')[-1].title()}\n"
         f"Members: {count}\n"
-        f"Username: @{chat.username}" if chat.username else "Username: Private"
+        f"Username: {username}"
     )
     await message.reply_text(text)
 
@@ -1139,14 +1207,489 @@ async def cmd_invite(_, message: types.Message):
 #  HELP
 # ═════════════════════════════════════════════════════════════════════════════
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ANTI-LINK  (auto-delete links; admins exempt)
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.on_message(filters.command("antilink") & filters.group)
+async def cmd_antilink(_, message: types.Message):
+    """aa: /antilink on|off — Toggle automatic link removal."""
+    if not await _assert_admin(message):
+        return await message.reply_text("❌ Only group admins.")
+
+    args = message.text.split()
+    if len(args) < 2 or args[1].lower() not in ("on", "off"):
+        current = await db.get_antilink(message.chat.id)
+        status = "🔴 ON" if current else "🟢 OFF"
+        return await message.reply_text(
+            f"🔗 Anti-link is currently <b>{status}</b>.\nUse /antilink on or /antilink off."
+        )
+
+    enable = args[1].lower() == "on"
+    await db.set_antilink(message.chat.id, enable)
+    await message.reply_text(
+        f"✅ Anti-link <b>{'enabled' if enable else 'disabled'}</b>. "
+        f"{'Links will be deleted and non-admins warned.' if enable else 'Links are now allowed.'}"
+    )
+    await _log(
+        f"<b>🔗 Anti-link {'ON' if enable else 'OFF'}</b>\n"
+        f"Chat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
+        f"By: {_mention(message.from_user)}\n"
+        f"Time: {_now()}"
+    )
+
+
+@app.on_message(filters.group & filters.text & ~filters.command([]))
+async def antilink_check(_, message: types.Message):
+    """Delete messages containing links if antilink is on and sender is not admin."""
+    if not message.from_user:
+        return
+    if not await db.get_antilink(message.chat.id):
+        return
+    if await is_admin(message.chat.id, message.from_user.id):
+        return
+    if message.from_user.id in app.sudoers:
+        return
+
+    if message.text and _URL_RE.search(message.text):
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        warn_count = await db.warn_user(message.chat.id, message.from_user.id, "Sent a link")
+        limit = await db.get_warn_limit(message.chat.id)
+        sent = await message.reply_text(
+            f"🔗 {_mention(message.from_user)} links are not allowed here!\n"
+            f"⚠️ Warning <b>{warn_count}/{limit}</b>."
+        )
+        await asyncio.sleep(5)
+        try:
+            await sent.delete()
+        except Exception:
+            pass
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ANTI-FORWARD  (delete forwarded messages; admins exempt)
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.on_message(filters.command("antiforward") & filters.group)
+async def cmd_antiforward(_, message: types.Message):
+    """aa: /antiforward on|off — Toggle deletion of forwarded messages."""
+    if not await _assert_admin(message):
+        return await message.reply_text("❌ Only group admins.")
+
+    args = message.text.split()
+    if len(args) < 2 or args[1].lower() not in ("on", "off"):
+        current = await db.get_antiforward(message.chat.id)
+        status = "🔴 ON" if current else "🟢 OFF"
+        return await message.reply_text(
+            f"↩️ Anti-forward is currently <b>{status}</b>.\nUse /antiforward on or /antiforward off."
+        )
+
+    enable = args[1].lower() == "on"
+    await db.set_antiforward(message.chat.id, enable)
+    await message.reply_text(
+        f"✅ Anti-forward <b>{'enabled' if enable else 'disabled'}</b>."
+    )
+    await _log(
+        f"<b>↩️ Anti-forward {'ON' if enable else 'OFF'}</b>\n"
+        f"Chat: <b>{message.chat.title}</b> (<code>{message.chat.id}</code>)\n"
+        f"By: {_mention(message.from_user)}\n"
+        f"Time: {_now()}"
+    )
+
+
+@app.on_message(filters.group & filters.forwarded)
+async def antiforward_check(_, message: types.Message):
+    """Delete forwarded messages if antiforward is on and sender is not admin."""
+    if not message.from_user:
+        return
+    if not await db.get_antiforward(message.chat.id):
+        return
+    if await is_admin(message.chat.id, message.from_user.id):
+        return
+    if message.from_user.id in app.sudoers:
+        return
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    sent = await message.reply_text(
+        f"↩️ {_mention(message.from_user)} forwarded messages are not allowed here!"
+    )
+    await asyncio.sleep(5)
+    try:
+        await sent.delete()
+    except Exception:
+        pass
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ANTI-WORDS  (banned words managed by admin via bot DM)
+# ═════════════════════════════════════════════════════════════════════════════
+# Admins set banned words by DMing the bot.
+# /setantiword <chat_id> <word>
+# /delantiword <chat_id> <word>
+# /listantiwords <chat_id>
+
+@app.on_message(filters.private & filters.command("setantiword"))
+async def cmd_set_antiword(_, message: types.Message):
+    """Admin DM: /setantiword <chat_id> <word> — Add a banned word for a group."""
+    if message.from_user.id not in app.sudoers:
+        if not hasattr(app, "_antiword_admins"):
+            app._antiword_admins = set()
+        # Allow group admins who have previously verified
+        pass
+
+    args = message.text.split(None, 2)
+    if len(args) < 3:
+        return await message.reply_text(
+            "Usage: /setantiword <chat_id> <word>\n"
+            "Example: /setantiword -1001234567890 badword"
+        )
+
+    try:
+        chat_id = int(args[1])
+    except ValueError:
+        return await message.reply_text("❌ Invalid chat ID.")
+
+    # Verify sender is admin of that group
+    if message.from_user.id not in app.sudoers:
+        if not await is_admin(chat_id, message.from_user.id):
+            return await message.reply_text("❌ You are not an admin of that group.")
+
+    word = args[2].lower().strip()
+    await db.add_antiword(chat_id, word)
+    await message.reply_text(f"✅ Word <code>{word}</code> added to banned list for chat <code>{chat_id}</code>.")
+
+
+@app.on_message(filters.private & filters.command("delantiword"))
+async def cmd_del_antiword(_, message: types.Message):
+    """Admin DM: /delantiword <chat_id> <word> — Remove a banned word."""
+    args = message.text.split(None, 2)
+    if len(args) < 3:
+        return await message.reply_text("Usage: /delantiword <chat_id> <word>")
+
+    try:
+        chat_id = int(args[1])
+    except ValueError:
+        return await message.reply_text("❌ Invalid chat ID.")
+
+    if message.from_user.id not in app.sudoers:
+        if not await is_admin(chat_id, message.from_user.id):
+            return await message.reply_text("❌ You are not an admin of that group.")
+
+    word = args[2].lower().strip()
+    removed = await db.remove_antiword(chat_id, word)
+    if removed:
+        await message.reply_text(f"✅ Word <code>{word}</code> removed.")
+    else:
+        await message.reply_text(f"❌ Word <code>{word}</code> not found in the list.")
+
+
+@app.on_message(filters.private & filters.command("listantiwords"))
+async def cmd_list_antiwords(_, message: types.Message):
+    """Admin DM: /listantiwords <chat_id> — List all banned words for a group."""
+    args = message.text.split(None, 1)
+    if len(args) < 2:
+        return await message.reply_text("Usage: /listantiwords <chat_id>")
+
+    try:
+        chat_id = int(args[1])
+    except ValueError:
+        return await message.reply_text("❌ Invalid chat ID.")
+
+    if message.from_user.id not in app.sudoers:
+        if not await is_admin(chat_id, message.from_user.id):
+            return await message.reply_text("❌ You are not an admin of that group.")
+
+    words = await db.get_antiwords(chat_id)
+    if not words:
+        return await message.reply_text(f"📭 No banned words for chat <code>{chat_id}</code>.")
+    await message.reply_text(
+        f"🚫 <b>Banned words for {chat_id}:</b>\n" +
+        "\n".join(f"• <code>{w}</code>" for w in words)
+    )
+
+
+@app.on_message(filters.private & filters.command("clearantiwords"))
+async def cmd_clear_antiwords(_, message: types.Message):
+    """Admin DM: /clearantiwords <chat_id> — Clear all banned words."""
+    args = message.text.split(None, 1)
+    if len(args) < 2:
+        return await message.reply_text("Usage: /clearantiwords <chat_id>")
+
+    try:
+        chat_id = int(args[1])
+    except ValueError:
+        return await message.reply_text("❌ Invalid chat ID.")
+
+    if message.from_user.id not in app.sudoers:
+        if not await is_admin(chat_id, message.from_user.id):
+            return await message.reply_text("❌ You are not an admin of that group.")
+
+    await db.clear_antiwords(chat_id)
+    await message.reply_text(f"✅ All banned words cleared for <code>{chat_id}</code>.")
+
+
+@app.on_message(filters.group & filters.text & ~filters.command([]))
+async def antiword_check(_, message: types.Message):
+    """Delete messages containing banned words and warn the user."""
+    if not message.from_user:
+        return
+    if await is_admin(message.chat.id, message.from_user.id):
+        return
+    if message.from_user.id in app.sudoers:
+        return
+
+    words = await db.get_antiwords(message.chat.id)
+    if not words:
+        return
+
+    text_lower = (message.text or "").lower()
+    hit = next((w for w in words if w in text_lower), None)
+    if not hit:
+        return
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    warn_count = await db.warn_user(message.chat.id, message.from_user.id, f"Used banned word: {hit}")
+    limit = await db.get_warn_limit(message.chat.id)
+
+    # Build message with admin-only remove-warn button
+    btn = types.InlineKeyboardMarkup([[
+        types.InlineKeyboardButton("✅ Remove Warn", callback_data=f"rmwarn_{message.from_user.id}")
+    ]])
+
+    sent = await app.send_message(
+        message.chat.id,
+        f"🚫 {_mention(message.from_user)} your message contained a banned word.\n"
+        f"⚠️ Warning <b>{warn_count}/{limit}</b>.",
+        reply_markup=btn,
+    )
+
+    if warn_count >= limit:
+        try:
+            await app.ban_chat_member(message.chat.id, message.from_user.id)
+            await db.reset_warns(message.chat.id, message.from_user.id)
+            await sent.edit_text(
+                f"🚫 {_mention(message.from_user)} reached the warn limit and has been <b>banned</b>.",
+            )
+        except Exception:
+            pass
+
+
+@app.on_callback_query(filters.regex(r"^rmwarn_(\d+)$"))
+async def cb_remove_warn(_, query: types.CallbackQuery):
+    """Admin-only button to remove a warning issued for anti-word."""
+    chat = query.message.chat
+    if not await is_admin(chat.id, query.from_user.id):
+        return await query.answer("❌ Only admins can remove warnings.", show_alert=True)
+
+    target_id = int(query.matches[0].group(1))
+    warns = await db.get_warns(chat.id, target_id)
+    if not warns:
+        return await query.answer("✅ User already has no warnings.", show_alert=True)
+
+    # Remove last warning
+    warns.pop()
+    await db.db.warns.update_one(
+        {"_id": f"{chat.id}:{target_id}"},
+        {"$set": {"warns": warns}},
+        upsert=True,
+    )
+    await query.answer("✅ One warning removed.", show_alert=True)
+    try:
+        limit = await db.get_warn_limit(chat.id)
+        await query.message.edit_reply_markup(
+            types.InlineKeyboardMarkup([[
+                types.InlineKeyboardButton(
+                    f"✅ Warn removed by {query.from_user.first_name} ({len(warns)}/{limit})",
+                    callback_data="noop"
+                )
+            ]])
+        )
+    except Exception:
+        pass
+    await _log(
+        f"<b>✅ Warn Removed via Button</b>\n"
+        f"Chat: <b>{chat.title}</b> (<code>{chat.id}</code>)\n"
+        f"Target ID: <code>{target_id}</code>\n"
+        f"By: {_mention(query.from_user)}\n"
+        f"Time: {_now()}"
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  TAGALL  (mention all members)
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.on_message(filters.command("tagall") & filters.group)
+async def cmd_tagall(_, message: types.Message):
+    """bb: /tagall [message] — Tag all members in the group."""
+    if not await _assert_bb(message):
+        return await message.reply_text("❌ Admins/authorised users only.")
+
+    args = message.text.split(None, 1)
+    header = args[1] if len(args) > 1 else "📣 Attention everyone!"
+
+    members = []
+    async for member in app.get_chat_members(message.chat.id):
+        if not member.user.is_bot and not member.user.is_deleted:
+            members.append(member.user)
+
+    if not members:
+        return await message.reply_text("❌ No members found.")
+
+    # Send in chunks of 5 mentions per message to avoid flood
+    chunk_size = 5
+    await message.reply_text(f"<b>{header}</b>")
+    for i in range(0, len(members), chunk_size):
+        chunk = members[i:i + chunk_size]
+        mentions = "  ".join(
+            f'<a href="tg://user?id={u.id}">{u.first_name or u.id}</a>'
+            for u in chunk
+        )
+        await app.send_message(message.chat.id, mentions)
+        await asyncio.sleep(0.5)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CAPTCHA
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.on_message(filters.command("captcha") & filters.group)
+async def cmd_captcha(_, message: types.Message):
+    """aa: /captcha on|off — Toggle captcha verification for new members."""
+    if not await _assert_admin(message):
+        return await message.reply_text("❌ Only group admins.")
+
+    args = message.text.split()
+    if len(args) < 2 or args[1].lower() not in ("on", "off"):
+        current = await db.get_captcha(message.chat.id)
+        status = "🔴 ON" if current else "🟢 OFF"
+        return await message.reply_text(
+            f"🔐 Captcha is currently <b>{status}</b>.\nUse /captcha on or /captcha off."
+        )
+
+    enable = args[1].lower() == "on"
+    await db.set_captcha(message.chat.id, enable)
+    await message.reply_text(
+        f"✅ Captcha <b>{'enabled' if enable else 'disabled'}</b>."
+    )
+
+
+async def _send_captcha(chat: types.Chat, user: types.User) -> None:
+    """Mute the new user and send them a math captcha to solve."""
+    # Mute until verified
+    try:
+        await app.restrict_chat_member(
+            chat.id,
+            user.id,
+            enums.ChatPermissions(
+                can_send_messages=False,
+                can_send_media_messages=False,
+                can_send_other_messages=False,
+                can_add_web_page_previews=False,
+            ),
+        )
+    except Exception:
+        return
+
+    # Generate a simple math question
+    a, b = random.randint(1, 15), random.randint(1, 15)
+    answer = a + b
+    wrong = [answer + random.randint(1, 5), answer - random.randint(1, 5), answer + random.randint(6, 12)]
+    random.shuffle(wrong)
+    options = wrong[:3] + [answer]
+    random.shuffle(options)
+
+    buttons = types.InlineKeyboardMarkup([[
+        types.InlineKeyboardButton(str(opt), callback_data=f"captcha_{user.id}_{opt}_{answer}")
+        for opt in options
+    ]])
+
+    sent = await app.send_message(
+        chat.id,
+        f"🔐 Welcome {_mention(user)}!\n"
+        f"Please solve this to verify you're human:\n\n"
+        f"<b>{a} + {b} = ?</b>\n\n"
+        f"You have <b>60 seconds</b> or you will be kicked.",
+        reply_markup=buttons,
+    )
+
+    if chat.id not in _captcha_pending:
+        _captcha_pending[chat.id] = {}
+    _captcha_pending[chat.id][user.id] = {"msg_id": sent.id, "answer": answer}
+
+    # Auto-kick after 60s if not verified
+    await asyncio.sleep(60)
+    if chat.id in _captcha_pending and user.id in _captcha_pending[chat.id]:
+        _captcha_pending[chat.id].pop(user.id)
+        try:
+            await app.ban_chat_member(chat.id, user.id)
+            await app.unban_chat_member(chat.id, user.id)  # kick, not ban
+            await sent.edit_text(
+                f"⏰ {_mention(user)} failed captcha and was kicked."
+            )
+        except Exception:
+            pass
+
+
+@app.on_callback_query(filters.regex(r"^captcha_(\d+)_(\d+)_(\d+)$"))
+async def cb_captcha(_, query: types.CallbackQuery):
+    """Handle captcha button presses."""
+    user_id = int(query.matches[0].group(1))
+    chosen = int(query.matches[0].group(2))
+    answer = int(query.matches[0].group(3))
+    chat = query.message.chat
+
+    # Only the target user can answer
+    if query.from_user.id != user_id:
+        return await query.answer("❌ This captcha is not for you!", show_alert=True)
+
+    if chosen == answer:
+        # Correct — restore permissions
+        if chat.id in _captcha_pending:
+            _captcha_pending[chat.id].pop(user_id, None)
+
+        try:
+            default = (await app.get_chat(chat.id)).permissions
+            await app.restrict_chat_member(
+                chat.id,
+                user_id,
+                default or enums.ChatPermissions(
+                    can_send_messages=True,
+                    can_send_media_messages=True,
+                    can_send_other_messages=True,
+                    can_add_web_page_previews=True,
+                ),
+            )
+        except Exception:
+            pass
+
+        await query.message.edit_text(
+            f"✅ {_mention(query.from_user)} passed the captcha! Welcome to <b>{chat.title}</b>. 🎉"
+        )
+    else:
+        # Wrong answer
+        await query.answer("❌ Wrong answer! Try again.", show_alert=True)
+
+
 GMGMT_HELP = """
 <b>🛡 Group Management Commands</b>
 
 <b>─── Welcome / Goodbye (aa = group admin) ───</b>
-/setwelcome &lt;text&gt; — Set welcome message
+/setwelcome &lt;text&gt; — Set welcome message (reply to photo for custom image)
 /setwelcome &lt;secs&gt; &lt;text&gt; — Set welcome + auto-delete delay
 /delwelcome — Remove welcome message
-/setgoodbye &lt;text&gt; — Set goodbye message
+/setgoodbye &lt;text&gt; — Set goodbye message (reply to photo for custom image)
 /delgoodbye — Remove goodbye message
 
 Variables: {mention} {first} {last} {title} {id}
@@ -1182,6 +1725,19 @@ Variables: {mention} {first} {last} {title} {id}
 /filters — List filters
 /stopfilter &lt;keyword&gt; — Remove filter (aa)
 
+<b>─── Anti-Link (aa) ───</b>
+/antilink on|off — Auto-delete links (admins exempt)
+
+<b>─── Anti-Forward (aa) ───</b>
+/antiforward on|off — Auto-delete forwarded messages (admins exempt)
+
+<b>─── Anti-Words (via bot DM) ───</b>
+/setantiword &lt;chat_id&gt; &lt;word&gt; — Add banned word
+/delantiword &lt;chat_id&gt; &lt;word&gt; — Remove banned word
+/listantiwords &lt;chat_id&gt; — List banned words
+/clearantiwords &lt;chat_id&gt; — Clear all banned words
+⚠️ Violations: message deleted + warn issued + admin remove-warn button shown
+
 <b>─── Locks (aa) ───</b>
 /lock &lt;type|all&gt; — Lock message type
 /unlock &lt;type|all&gt; — Unlock
@@ -1198,6 +1754,12 @@ Types: sticker, gif, link, media, poll, all
 /pin — Pin replied message
 /unpin — Unpin message
 /invitelink — Generate invite link
+
+<b>─── Tag All (bb) ───</b>
+/tagall [message] — Mention all members
+
+<b>─── Captcha (aa) ───</b>
+/captcha on|off — Math captcha for new members (auto-kick on timeout)
 
 <b>─── Info ───</b>
 /info — User info
