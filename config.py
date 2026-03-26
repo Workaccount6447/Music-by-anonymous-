@@ -1,7 +1,7 @@
 from os import getenv
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv("config.env")
 
 class Config:
     def __init__(self):
@@ -40,6 +40,22 @@ class Config:
         self.DEFAULT_THUMB = getenv("DEFAULT_THUMB", "https://te.legra.ph/file/3e40a408286d4eda24191.jpg")
         self.PING_IMG = getenv("PING_IMG", "https://files.catbox.moe/haagg2.png")
         self.START_IMG = getenv("START_IMG", "https://files.catbox.moe/zvziwk.jpg")
+
+        # ── Welcome / Goodbye ─────────────────────────────────────────────
+        # Photo sent with every welcome/goodbye message (direct image URL).
+        self.WELCOME_PHOTO = getenv(
+            "WELCOME_PHOTO",
+            "https://te.legra.ph/file/3e40a408286d4eda24191.jpg",
+        )
+        # Supports variables: {mention} {first} {last} {full} {title} {id}
+        self.WELCOME_TEXT = getenv(
+            "WELCOME_TEXT",
+            "👋 Welcome {mention} to <b>{title}</b>!\n\nWe're glad to have you here. Please read the group rules and enjoy your stay. 🎉",
+        )
+        self.GOODBYE_TEXT = getenv(
+            "GOODBYE_TEXT",
+            "👋 Goodbye {first}! We'll miss you in <b>{title}</b>. Hope to see you again! 🙏",
+        )
 
     def check(self):
         missing = [
